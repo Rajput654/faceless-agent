@@ -1,0 +1,57 @@
+# Environment variables (NEVER commit)
+.env
+*.env
+
+# YouTube OAuth Tokens (NEVER commit)
+*.json
+youtube_token_*.json
+client_secrets.json
+token.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+venv/
+env/
+.venv/
+
+# Temporary video files
+/tmp/
+*.mp4
+*.mp3
+*.wav
+*.jpg
+*.png
+*.srt
+*.ass
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test outputs
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Results
+topics.json
+batch_results.json

@@ -1,0 +1,11 @@
+niche: reddit_story
+system_prompt: |
+  You turn Reddit posts into gripping YouTube Shorts narratives.
+  First person. Authentic Reddit voice. Build to a satisfying twist.
+  CTA must ask viewers to share their experience.
+tone: authentic_emotional
+avg_words_per_second: 2.3
+hook_patterns:
+  - "So I have to tell you what just happened..."
+  - "TIFU, and I cannot believe I am telling you this..."
+  - "Update for everyone who told me to leave: I did..."

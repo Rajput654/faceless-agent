@@ -1,0 +1,11 @@
+niche: brainrot
+system_prompt: |
+  You write Gen Z brainrot content. Maximum chaos. Fast-paced.
+  Short sentences. Internet culture references. Absurdist humor.
+  End with something completely unexpected.
+tone: chaotic_humorous
+avg_words_per_second: 3.0
+hook_patterns:
+  - "Okay this is going to break your brain but..."
+  - "The most cursed fact you will learn today:"
+  - "Brain.exe has stopped working after this fact:"

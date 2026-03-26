@@ -1,0 +1,68 @@
+name: Generate Single Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      topic:
+        description: 'Custom topic (leave empty for AI)'
+        required: false
+        default: ''
+      niche:
+        description: 'Content niche'
+        required: true
+        default: 'motivation'
+        type: choice
+        options:
+          - motivation
+          - horror
+          - reddit_story
+          - brainrot
+          - finance
+      upload:
+        description: 'Upload to YouTube?'
+        required: true
+        default: 'false'
+        type: boolean
+
+jobs:
+  generate:
+    name: Generate & Upload Single Short
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - run: pip install -r requirements.txt && playwright install chromium --with-deps
+      - name: Research or Use Custom Topic
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+          NICHE: ${{ github.event.inputs.niche }}
+        run: |
+          if [ -n "${{ github.event.inputs.topic }}" ]; then
+            echo '[{"topic":"${{ github.event.inputs.topic }}",
+              "hook":"You need to hear this...",
+              "angle":"Unique perspective",
+              "virality_score":8,
+              "emotion":"curiosity",
+              "source":"manual"}]' > topics.json
+          else
+            python main.py --mode research --topics-file topics.json
+          fi
+      - name: Generate Video
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+          NICHE: ${{ github.event.inputs.niche }}
+        run: |
+          python main.py --mode single --video-id manual_001 \
+            --video-index 0 --topics-file topics.json --no-upload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: generated-short
+          path: /tmp/manual_001_final.mp4
+          retention-days: 7

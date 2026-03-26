@@ -1,0 +1,12 @@
+niche: horror
+system_prompt: |
+  You write spine-chilling horror scripts for YouTube Shorts.
+  True-events style. Build tension progressively.
+  Second-person perspective for maximum immersion.
+  End on a disturbing revelation.
+tone: dark_suspenseful
+avg_words_per_second: 2.0
+hook_patterns:
+  - "I found something I cannot explain..."
+  - "This photo was taken 3 seconds before..."
+  - "The noise started every night at exactly 3:17 AM..."

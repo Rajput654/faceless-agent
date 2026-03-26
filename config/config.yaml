@@ -1,0 +1,80 @@
+video:
+  niche: "motivation"
+  daily_count: 10
+  duration_seconds: 55
+  resolution: "1080x1920"
+  fps: 30
+  quality_threshold: 0.75
+  max_retries: 3
+
+voice:
+  primary: "en-US-GuyNeural"
+  fallback: "en-US-AriaNeural"
+  rate: "+10%"
+  pitch: "0Hz"
+  volume: "+0%"
+
+llm:
+  primary_model: "llama-3.3-70b-versatile"
+  fallback_model: "gemini-2.0-flash"
+  temperature: 0.8
+  max_tokens: 2000
+  timeout: 30
+
+images:
+  provider: "pollinations"
+  style: "cinematic"
+  count_per_scene: 1
+  width: 1080
+  height: 1920
+
+music:
+  provider: "pixabay"
+  duration_seconds: 60
+  volume_reduction: 0.12
+
+youtube:
+  category_id: "22"
+  language: "en"
+  made_for_kids: false
+  privacy: "public"
+  post_times:
+    - "08:00"
+    - "09:30"
+    - "11:00"
+    - "12:30"
+    - "14:00"
+    - "15:30"
+    - "17:00"
+    - "18:30"
+    - "20:00"
+    - "21:30"
+
+reddit:
+  subreddits:
+    motivation:
+      - "GetMotivated"
+      - "selfimprovement"
+      - "LifeProTips"
+    horror:
+      - "nosleep"
+      - "LetsNotMeet"
+      - "creepyencounters"
+    reddit_story:
+      - "TIFU"
+      - "AmItheAsshole"
+      - "relationship_advice"
+    brainrot:
+      - "memes"
+      - "dankmemes"
+    finance:
+      - "personalfinance"
+      - "investing"
+      - "wallstreetbets"
+  post_limit: 50
+  min_score: 1000
+
+database:
+  topics_table: "topics"
+  videos_table: "videos"
+  analytics_table: "analytics"

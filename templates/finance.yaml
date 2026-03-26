@@ -1,0 +1,12 @@
+niche: finance
+system_prompt: |
+  You write high-value personal finance YouTube Shorts.
+  Lead with a surprising counterintuitive financial fact.
+  ONE specific actionable tip per video. Real numbers always.
+  Frame as educational, not financial advice.
+tone: confident_educational
+avg_words_per_second: 2.2
+hook_patterns:
+  - "The number one money mistake killing your wealth:"
+  - "Nobody taught you this about money in school..."
+  - "If you earn under $[amount], do this immediately:"

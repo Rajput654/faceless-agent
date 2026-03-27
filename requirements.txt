@@ -5,27 +5,36 @@ langchain-groq==0.2.3
 langchain-community==0.3.10
 groq==0.13.0
 google-generativeai==0.8.3
-edge-tts==6.1.12
+# TTS backends — Kokoro is primary (near-human), gTTS is fallback
+kokoro-onnx>=0.4.0
+soundfile>=0.12.1
 gtts>=2.5.1
 mutagen>=1.47.0
+edge-tts==6.1.12
+# Video / audio
 ffmpeg-python==0.2.0
 Pillow==11.0.0
+pydub==0.25.1
+# HTTP / scraping
 requests==2.32.3
 aiohttp==3.11.10
 aiofiles==24.1.0
-praw==7.8.1
+beautifulsoup4==4.12.3
 playwright==1.49.0
-supabase>=2.10.0
+praw==7.8.1
+# Google / YouTube
 google-api-python-client==2.155.0
 google-auth-oauthlib==1.2.1
 google-auth-httplib2==0.2.0
+# DB / config
+supabase>=2.10.0
 pydantic==2.10.3
 python-dotenv==1.0.1
 PyYAML==6.0.2
-pydub==0.25.1
+# LLM / observability
 tenacity==9.0.0
 loguru==0.7.3
 httpx>=0.26,<0.29
-beautifulsoup4==4.12.3
 langfuse>=2.57.2
+# Testing
 pytest==8.3.4

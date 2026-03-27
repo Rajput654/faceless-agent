@@ -1,8 +1,14 @@
 """
 agents/voice_producer.py
 Generates voiceover audio and subtitle files from a script using Edge TTS.
+
+edge-tts parameter format rules (strictly enforced by the library):
+  rate   : must include sign  e.g. "+10%", "-5%", "+0%"
+  pitch  : must include sign  e.g. "+0Hz", "+10Hz", "-5Hz"
+  volume : must include sign  e.g. "+0%", "+10%"
 """
 import os
+import re
 from loguru import logger
 from mcp_servers.tts_server import TTSMCPServer
 
@@ -24,6 +30,25 @@ NICHE_RATES = {
 }
 
 
+def _fix_pitch(pitch: str) -> str:
+    """
+    Ensure pitch has a sign prefix required by edge-tts.
+    "0Hz" -> "+0Hz",  "5Hz" -> "+5Hz",  "+5Hz" -> "+5Hz" (no-op)
+    """
+    pitch = pitch.strip()
+    if pitch and pitch[0] not in ("+", "-"):
+        pitch = "+" + pitch
+    return pitch
+
+
+def _fix_rate(rate: str) -> str:
+    """Ensure rate has a sign prefix. "10%" -> "+10%"."""
+    rate = rate.strip()
+    if rate and rate[0] not in ("+", "-"):
+        rate = "+" + rate
+    return rate
+
+
 class VoiceProducerAgent:
     def __init__(self, config):
         self.config = config
@@ -35,18 +60,20 @@ class VoiceProducerAgent:
 
         niche = os.environ.get("NICHE", self.config.get("video", {}).get("niche", "motivation"))
 
-        # Pick voice and rate based on niche, fall back to config defaults
         voice = NICHE_VOICES.get(niche, self.voice_config.get("primary", "en-US-GuyNeural"))
-        rate = NICHE_RATES.get(niche, self.voice_config.get("rate", "+10%"))
-        pitch = self.voice_config.get("pitch", "0Hz")
-        volume = self.voice_config.get("volume", "+0%")
+        rate  = _fix_rate(NICHE_RATES.get(niche, self.voice_config.get("rate", "+10%")))
+        # FIX: always sanitise pitch — config may contain bare "0Hz"
+        pitch  = _fix_pitch(self.voice_config.get("pitch", "+0Hz"))
+        volume = _fix_rate(self.voice_config.get("volume", "+0%"))
+
+        logger.debug(f"TTS params → voice={voice} rate={rate} pitch={pitch} volume={volume}")
 
         script_text = script.get("script", "")
         if not script_text:
             logger.error("No script text found in script dict")
             return {"success": False, "error": "Empty script text"}
 
-        audio_path = f"{output_dir}/{video_id}_voice.mp3"
+        audio_path    = f"{output_dir}/{video_id}_voice.mp3"
         subtitle_path = f"{output_dir}/{video_id}_subtitles.srt"
 
         result = self.tts_server.call(

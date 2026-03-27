@@ -67,7 +67,6 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
 
-      # FFmpeg is NOT pre-installed on ubuntu-latest — must be installed explicitly
       - name: Install FFmpeg
         run: |
           sudo apt-get update -qq
@@ -82,7 +81,6 @@ jobs:
         with:
           name: topics-queue
 
-      # Sanity-check the environment before running the expensive generation step
       - name: Verify environment
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
@@ -109,6 +107,16 @@ jobs:
           which ffmpeg  && echo "✅ ffmpeg found"  || echo "❌ ffmpeg MISSING"
           which ffprobe && echo "✅ ffprobe found" || echo "❌ ffprobe MISSING"
 
+          echo ""
+          echo "=== edge-tts smoke test ==="
+          python -c "
+          import edge_tts
+          print(f'edge-tts version: {getattr(edge_tts, \"__version__\", \"unknown\")}')
+          sm = edge_tts.SubMaker()
+          methods = [m for m in dir(sm) if not m.startswith('_')]
+          print(f'SubMaker methods: {methods}')
+          "
+
       - name: Generate Video
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
@@ -117,20 +125,22 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           NICHE: ${{ env.NICHE }}
+        # FIX: use set -o pipefail so Python errors aren't masked, and
+        # run with unbuffered output (-u) so logs appear in real time
         run: |
           VIDEO_ID="video_$(printf '%03d' ${{ matrix.video_index }})"
           echo "Starting generation for: $VIDEO_ID"
-          python main.py \
+          set -o pipefail
+          python -u main.py \
             --mode single \
-            --video-id $VIDEO_ID \
+            --video-id "$VIDEO_ID" \
             --video-index ${{ matrix.video_index }} \
             --topics-file topics.json \
             --no-upload
-          EXIT_CODE=$?
-          echo "Python exit code: $EXIT_CODE"
-          exit $EXIT_CODE
+          # main.py now calls sys.exit(1) on pipeline failure,
+          # so a non-zero exit here means something real went wrong.
 
-      # Runs whether generation passed or failed — shows exactly what was/wasn't created
+      # Always runs — shows exactly what was/wasn't created
       - name: Debug output files
         if: always()
         run: |
@@ -144,7 +154,7 @@ jobs:
           echo "=== JPG files (images) ==="
           find /tmp -name "*.jpg" -exec ls -lh {} \; 2>/dev/null || echo "None"
           echo "=== SRT/ASS files (captions) ==="
-          find /tmp -name "*.srt" -o -name "*.ass" 2>/dev/null | xargs ls -lh 2>/dev/null || echo "None"
+          find /tmp \( -name "*.srt" -o -name "*.ass" \) -exec ls -lh {} \; 2>/dev/null || echo "None"
 
       - name: Set video path env var
         run: |

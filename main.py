@@ -40,16 +40,20 @@ def main():
     parser.add_argument("--video-index", type=int, default=0)
     parser.add_argument("--count", type=int, default=10)
     parser.add_argument("--topics-file", default="topics.json")
-    parser.add_argument("--no-upload", action="store_true")
+    # FIX: --no-upload flag now properly controls upload behaviour
+    parser.add_argument("--no-upload", action="store_true",
+                        help="Skip YouTube upload (default: upload is ON)")
     args = parser.parse_args()
+
+    # Upload is ON by default; only skip when --no-upload is passed
+    should_upload = not args.no_upload
 
     validate_env()
     config = load_config()
 
     logger.info("FACELESS AGENT - Starting...")
-    logger.info(f"Mode: {args.mode} | Niche: {config['video']['niche']}")
+    logger.info(f"Mode: {args.mode} | Niche: {config['video']['niche']} | Upload: {should_upload}")
 
-    # Import and run appropriate workflow
     from agents.research_scout import ResearchScoutAgent
     from workflows.batch_workflow import BatchWorkflow
 
@@ -61,19 +65,17 @@ def main():
         logger.success(f"Research complete: {len(topics)} topics")
 
     elif args.mode == "batch" or args.mode == "daily":
-        # Run research first
         scout = ResearchScoutAgent(config)
         topics = scout.run()
         with open(args.topics_file, "w") as f:
             json.dump(topics, f, indent=2)
 
-        # Then batch generate
         workflow = BatchWorkflow(config)
-        workflow.run_daily_batch(args.topics_file)
+        # FIX: pass upload flag through to batch workflow
+        workflow.run_daily_batch(args.topics_file, upload=should_upload)
 
     else:
-        logger.info(f"Single video mode: index {args.video_index}")
-        # Load topics and run single video
+        logger.info(f"Single video mode: index {args.video_index} | upload={should_upload}")
         try:
             with open(args.topics_file) as f:
                 topics = json.load(f)
@@ -86,7 +88,8 @@ def main():
         result = workflow.run_single_video(
             topics[args.video_index],
             args.video_id,
-            args.video_index
+            args.video_index,
+            upload=should_upload,   # FIX: was never passed before
         )
         logger.info(f"Result: {result}")
 

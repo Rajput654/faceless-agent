@@ -193,7 +193,8 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
-      - run: pip install google-api-python-client google-auth-oauthlib google-auth-httplib2
+      # Install full requirements so upload.py can import yaml, loguru, etc.
+      - run: pip install -r requirements.txt
       - uses: actions/download-artifact@v4
         with:
           name: video-${{ matrix.video_index }}

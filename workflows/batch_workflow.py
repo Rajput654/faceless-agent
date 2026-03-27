@@ -16,8 +16,9 @@ class BatchWorkflow:
         self.analytics = AnalyticsMCPServer()
         self.video_workflow = VideoWorkflow(config)
 
-    def run_daily_batch(self, topics_path: str = "topics.json", mode: str = "sequential"):
-        logger.info("=== BatchWorkflow starting daily batch ===")
+    def run_daily_batch(self, topics_path: str = "topics.json", mode: str = "sequential", upload: bool = True):
+        # FIX: upload param added (was missing — every batch run was silently skipping upload)
+        logger.info(f"=== BatchWorkflow starting daily batch | upload={upload} ===")
 
         try:
             with open(topics_path) as f:
@@ -40,14 +41,14 @@ class BatchWorkflow:
             logger.info(f"\n--- Video {i+1}/{len(topics)}: {topic.get('topic', 'Unknown')} ---")
 
             try:
-                result = self.video_workflow.run_single_video(topic, video_id, i, upload=False)
+                # FIX: upload flag is now forwarded into each video run
+                result = self.video_workflow.run_single_video(topic, video_id, i, upload=upload)
                 results.append(result)
 
                 if result.get("outcome") == "success":
                     passed += 1
                     logger.success(f"✅ Video {i+1} passed: {result.get('final_video_path')}")
 
-                    # Save to analytics
                     self.analytics.call(
                         "save_video",
                         video_id=video_id,
@@ -55,7 +56,8 @@ class BatchWorkflow:
                         topic=result.get("topic", ""),
                         niche=self.config.get("video", {}).get("niche", "motivation"),
                         quality_score=result.get("quality_score", 0.0),
-                        status="ready",
+                        youtube_url=result.get("publish_result", {}).get("youtube_url"),
+                        status="published" if upload and result.get("publish_result", {}).get("status") == "published" else "ready",
                     )
                 else:
                     failed += 1
@@ -66,11 +68,9 @@ class BatchWorkflow:
                 logger.error(f"❌ Video {i+1} crashed: {e}")
                 results.append({"video_id": video_id, "outcome": "failed", "error": str(e)})
 
-            # Small delay between videos to avoid rate limits
             if i < len(topics) - 1:
                 time.sleep(2)
 
-        # Save batch summary
         niche = self.config.get("video", {}).get("niche", "motivation")
         self.analytics.call("save_batch_run", total=len(topics), passed=passed, failed=failed, niche=niche)
 

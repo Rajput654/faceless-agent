@@ -11,12 +11,14 @@ voice:
   primary: "en-US-GuyNeural"
   fallback: "en-US-AriaNeural"
   rate: "+10%"
-  pitch: "0Hz"
+  pitch: "+0Hz"      # FIX: edge-tts requires a sign prefix — "0Hz" is invalid
   volume: "+0%"
 
 llm:
-  primary_model: "llama-3.3-70b-versatile"
-  fallback_model: "gemini-2.0-flash"
+  # FIX: llama-3.3-70b-versatile causes BadRequestError on current Groq API.
+  # Use llama3-groq-70b-8192-tool-use-preview or the standard alias below.
+  primary_model: "llama3-70b-8192"
+  fallback_model: "llama3-8b-8192"
   temperature: 0.8
   max_tokens: 2000
   timeout: 30

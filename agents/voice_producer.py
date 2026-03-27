@@ -1,68 +1,51 @@
 """
-agents/voice_producer.py
-Converts script text to MP3 audio + SRT subtitles using edge-tts.
+agents/music_director.py
+Fetches background music appropriate for the video's emotion and niche.
 """
 import os
 from loguru import logger
-from mcp_servers.tts_server import TTSMCPServer
+from mcp_servers.music_server import MusicMCPServer
 
 
-class VoiceProducerAgent:
+NICHE_MUSIC_QUERIES = {
+    "motivation": ["uplifting motivational", "epic cinematic", "inspiring background"],
+    "horror": ["dark ambient horror", "suspenseful scary", "creepy atmospheric"],
+    "reddit_story": ["storytelling background", "calm narrative music", "ambient background"],
+    "brainrot": ["chaotic electronic", "funny meme music", "upbeat energetic"],
+    "finance": ["corporate background", "calm piano background", "professional ambient"],
+}
+
+
+class MusicDirectorAgent:
     def __init__(self, config):
         self.config = config
-        self.tts = TTSMCPServer()
-        self.voice_config = config.get("voice", {})
+        self.music_server = MusicMCPServer()
+        self.music_config = config.get("music", {})
 
     def run(self, script: dict, video_id: str, output_dir: str = "/tmp", *args, **kwargs):
-        logger.info(f"VoiceProducerAgent generating audio for video: {video_id}")
+        logger.info(f"MusicDirectorAgent fetching music for video: {video_id}")
 
-        script_text = script.get("script", "")
-        if not script_text:
-            return {"success": False, "error": "No script text provided"}
+        niche = os.environ.get("NICHE", self.config.get("video", {}).get("niche", "motivation"))
+        emotion = script.get("emotion", "inspiration")
+        music_path = f"{output_dir}/{video_id}_music.mp3"
 
-        audio_path = f"{output_dir}/{video_id}_voice.mp3"
-        subtitle_path = f"{output_dir}/{video_id}_subtitles.srt"
+        queries = NICHE_MUSIC_QUERIES.get(niche, ["background music cinematic"])
 
-        primary_voice = self.voice_config.get("primary", "en-US-GuyNeural")
-        fallback_voice = self.voice_config.get("fallback", "en-US-AriaNeural")
-        rate = self.voice_config.get("rate", "+10%")
-        pitch = self.voice_config.get("pitch", "0Hz")
-        volume = self.voice_config.get("volume", "+0%")
-
-        # Try primary voice
-        result = self.tts.call(
-            "generate_speech",
-            text=script_text,
-            output_path=audio_path,
-            subtitle_path=subtitle_path,
-            voice=primary_voice,
-            rate=rate,
-            pitch=pitch,
-            volume=volume,
-        )
-
-        if not result.get("success"):
-            logger.warning(f"Primary voice failed: {result.get('error')}. Trying fallback voice.")
-            result = self.tts.call(
-                "generate_speech",
-                text=script_text,
-                output_path=audio_path,
-                subtitle_path=subtitle_path,
-                voice=fallback_voice,
-                rate=rate,
-                pitch=pitch,
-                volume=volume,
+        for query in queries:
+            result = self.music_server.call(
+                "fetch_music",
+                query=query,
+                output_path=music_path,
+                duration_seconds=self.music_config.get("duration_seconds", 60),
             )
+            if result.get("success"):
+                logger.success(f"Music fetched: {music_path}")
+                return {
+                    "success": True,
+                    "music_path": music_path,
+                    "title": result.get("title", query),
+                    "volume_reduction": self.music_config.get("volume_reduction", 0.12),
+                }
 
-        if result.get("success"):
-            logger.success(f"Audio generated: {audio_path}")
-            return {
-                "success": True,
-                "audio_path": audio_path,
-                "subtitle_path": subtitle_path,
-                "voice_used": result.get("voice_used", primary_voice),
-                "audio_size_bytes": result.get("audio_size_bytes", 0),
-            }
-        else:
-            logger.error(f"Voice production failed: {result.get('error')}")
-            return {"success": False, "error": result.get("error", "TTS failed")}
+        logger.warning("Music fetch failed. Video will have no background music.")
+        return {"success": False, "music_path": None, "error": "All music sources failed"}

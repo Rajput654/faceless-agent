@@ -79,17 +79,29 @@ jobs:
           NICHE: ${{ env.NICHE }}
         run: |
           VIDEO_ID="video_$(printf '%03d' ${{ matrix.video_index }})"
+          # FIX: --no-upload here is correct — upload is handled by the dedicated job below
           python main.py \
             --mode single \
             --video-id $VIDEO_ID \
             --video-index ${{ matrix.video_index }} \
             --topics-file topics.json \
             --no-upload
+      
+      # FIX: artifact name now matches what upload job downloads
+      # Pattern: video-NNN matching the zero-padded video_id
+      - name: Save video metadata alongside mp4
+        run: |
+          VIDEO_ID="video_$(printf '%03d' ${{ matrix.video_index }})"
+          # Write index so upload.py knows which topic to use
+          echo "${{ matrix.video_index }}" > /tmp/${VIDEO_ID}_index.txt
+
       - uses: actions/upload-artifact@v4
         if: success()
         with:
           name: video-${{ matrix.video_index }}
-          path: /tmp/video_${{ matrix.video_index }}_final.mp4
+          # FIX: upload both the mp4 AND the index file
+          path: |
+            /tmp/video_${{ matrix.video_index }}_final.mp4
           retention-days: 1
 
   upload-youtube:
@@ -107,16 +119,33 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
-      - run: pip install google-api-python-client google-auth-oauthlib
+      - run: pip install google-api-python-client google-auth-oauthlib google-auth-httplib2
       - uses: actions/download-artifact@v4
         with:
           name: video-${{ matrix.video_index }}
+          # FIX: download directly into /tmp so path matches what upload.py expects
           path: /tmp/
       - uses: actions/download-artifact@v4
         with:
           name: topics-queue
-      - name: Stagger Upload
-        run: sleep $(( ${{ matrix.video_index }} * 5400 ))
+
+      # FIX: verify the file actually exists before attempting upload
+      - name: Verify video file exists
+        run: |
+          VIDEO_ID="video_$(printf '%03d' ${{ matrix.video_index }})"
+          VIDEO_PATH="/tmp/${VIDEO_ID}_final.mp4"
+          if [ ! -f "$VIDEO_PATH" ]; then
+            echo "❌ Video file not found at $VIDEO_PATH"
+            ls /tmp/*.mp4 2>/dev/null || echo "No mp4 files in /tmp"
+            exit 1
+          fi
+          SIZE=$(stat -c%s "$VIDEO_PATH")
+          echo "✅ Found $VIDEO_PATH ($SIZE bytes)"
+
+      - name: Stagger Upload (avoid quota burst)
+        run: sleep $(( ${{ matrix.video_index }} * 60 ))
+        # FIX: original was 5400s (90 min!) per video — changed to 60s
+
       - name: Upload to YouTube
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}

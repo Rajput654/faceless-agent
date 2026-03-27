@@ -61,14 +61,54 @@ jobs:
         video_index: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
-      - run: pip install -r requirements.txt
+
+      # FFmpeg is NOT pre-installed on ubuntu-latest — must be installed explicitly
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
       - uses: actions/download-artifact@v4
         with:
           name: topics-queue
+
+      # Sanity-check the environment before running the expensive generation step
+      - name: Verify environment
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+        run: |
+          echo "=== Topics file ==="
+          python -c "
+          import json
+          t = json.load(open('topics.json'))
+          print(f'Topics loaded: {len(t)}')
+          idx = ${{ matrix.video_index }}
+          if idx < len(t):
+              print(f'Topic [{idx}]: {t[idx].get(\"topic\", \"?\")}')
+          else:
+              print(f'ERROR: index {idx} out of range (only {len(t)} topics)')
+              exit(1)
+          "
+          echo ""
+          echo "=== Key checks ==="
+          echo "NICHE: ${{ env.NICHE }}"
+          echo "Video index: ${{ matrix.video_index }}"
+          [ -n "$GROQ_API_KEY" ]   && echo "✅ GROQ_API_KEY is set"   || echo "❌ GROQ_API_KEY is MISSING"
+          [ -n "$PEXELS_API_KEY" ] && echo "✅ PEXELS_API_KEY is set" || echo "⚠️  PEXELS_API_KEY not set (will use Pollinations fallback)"
+          which ffmpeg  && echo "✅ ffmpeg found"  || echo "❌ ffmpeg MISSING"
+          which ffprobe && echo "✅ ffprobe found" || echo "❌ ffprobe MISSING"
+
       - name: Generate Video
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
@@ -79,31 +119,48 @@ jobs:
           NICHE: ${{ env.NICHE }}
         run: |
           VIDEO_ID="video_$(printf '%03d' ${{ matrix.video_index }})"
+          echo "Starting generation for: $VIDEO_ID"
           python main.py \
             --mode single \
             --video-id $VIDEO_ID \
             --video-index ${{ matrix.video_index }} \
             --topics-file topics.json \
             --no-upload
+          EXIT_CODE=$?
+          echo "Python exit code: $EXIT_CODE"
+          exit $EXIT_CODE
 
-      # FIX: capture the zero-padded path into an env var so upload-artifact can use it
+      # Runs whether generation passed or failed — shows exactly what was/wasn't created
+      - name: Debug output files
+        if: always()
+        run: |
+          echo "=== All files in /tmp ==="
+          ls -lh /tmp/ 2>/dev/null || echo "/tmp is empty"
+          echo ""
+          echo "=== MP4 files ==="
+          find /tmp -name "*.mp4" -exec ls -lh {} \; 2>/dev/null || echo "None"
+          echo "=== MP3 files (voice) ==="
+          find /tmp -name "*.mp3" -exec ls -lh {} \; 2>/dev/null || echo "None"
+          echo "=== JPG files (images) ==="
+          find /tmp -name "*.jpg" -exec ls -lh {} \; 2>/dev/null || echo "None"
+          echo "=== SRT/ASS files (captions) ==="
+          find /tmp -name "*.srt" -o -name "*.ass" 2>/dev/null | xargs ls -lh 2>/dev/null || echo "None"
+
       - name: Set video path env var
         run: |
           echo "VIDEO_PATH=/tmp/video_$(printf '%03d' ${{ matrix.video_index }})_final.mp4" >> $GITHUB_ENV
 
-      # FIX: verify the file was actually created before attempting to upload it
       - name: Verify video file exists
         run: |
           if [ ! -f "${{ env.VIDEO_PATH }}" ]; then
             echo "❌ Video file not found at ${{ env.VIDEO_PATH }}"
-            ls /tmp/*.mp4 2>/dev/null || echo "No mp4 files in /tmp"
+            echo "Files in /tmp:"
+            ls -lh /tmp/
             exit 1
           fi
           SIZE=$(stat -c%s "${{ env.VIDEO_PATH }}")
           echo "✅ Found ${{ env.VIDEO_PATH }} ($SIZE bytes)"
 
-      # FIX: path now uses the zero-padded env var (e.g. video_000_final.mp4)
-      # instead of the raw matrix index (e.g. video_0_final.mp4) which never existed
       - uses: actions/upload-artifact@v4
         if: success()
         with:
@@ -130,7 +187,6 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: video-${{ matrix.video_index }}
-          # Download directly into /tmp so the path matches what upload.py expects
           path: /tmp/
       - uses: actions/download-artifact@v4
         with:

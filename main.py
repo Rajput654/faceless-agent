@@ -40,12 +40,10 @@ def main():
     parser.add_argument("--video-index", type=int, default=0)
     parser.add_argument("--count", type=int, default=10)
     parser.add_argument("--topics-file", default="topics.json")
-    # FIX: --no-upload flag now properly controls upload behaviour
     parser.add_argument("--no-upload", action="store_true",
                         help="Skip YouTube upload (default: upload is ON)")
     args = parser.parse_args()
 
-    # Upload is ON by default; only skip when --no-upload is passed
     should_upload = not args.no_upload
 
     validate_env()
@@ -71,7 +69,6 @@ def main():
             json.dump(topics, f, indent=2)
 
         workflow = BatchWorkflow(config)
-        # FIX: pass upload flag through to batch workflow
         workflow.run_daily_batch(args.topics_file, upload=should_upload)
 
     else:
@@ -89,9 +86,23 @@ def main():
             topics[args.video_index],
             args.video_id,
             args.video_index,
-            upload=should_upload,   # FIX: was never passed before
+            upload=should_upload,
         )
         logger.info(f"Result: {result}")
+
+        # FIX: exit with code 1 so GitHub Actions marks the step as FAILED
+        # and the error is visible in the logs instead of silently passing
+        if result.get("outcome") != "success":
+            logger.error(
+                f"Pipeline FAILED for {args.video_id}: {result.get('error', 'Unknown error')}\n"
+                f"Status: {result.get('status')} | Quality score: {result.get('quality_score')}\n"
+                f"Issues: {result.get('quality_issues', [])}"
+            )
+            sys.exit(1)
+
+        logger.success(
+            f"Pipeline SUCCEEDED for {args.video_id}: {result.get('final_video_path')}"
+        )
 
 
 if __name__ == "__main__":

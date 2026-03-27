@@ -1,11 +1,13 @@
 """
 mcp_servers/social_server.py
 Handles YouTube video uploads using the YouTube Data API v3.
+
+Project selection:
+  - Even-indexed videos → project A
+  - Odd-indexed videos  → project B  (falls back to A if B creds not set)
 """
 import os
-import json
 import time
-import random
 from loguru import logger
 
 try:
@@ -28,22 +30,37 @@ class SocialMCPServer:
             return {"success": False, "error": f"Unknown tool: {tool_name}"}
         return self.tools[tool_name](**kwargs)
 
+    def _has_credentials(self, project: str) -> bool:
+        return all([
+            os.environ.get(f"YOUTUBE_CLIENT_ID_{project}"),
+            os.environ.get(f"YOUTUBE_CLIENT_SECRET_{project}"),
+            os.environ.get(f"YOUTUBE_REFRESH_TOKEN_{project}"),
+        ])
+
     def _get_youtube_client(self, project: str = "A"):
         if not GOOGLE_LIBS:
             raise RuntimeError("google-api-python-client not installed")
 
-        client_id = os.environ.get(f"YOUTUBE_CLIENT_ID_{project}", "")
-        client_secret = os.environ.get(f"YOUTUBE_CLIENT_SECRET_{project}", "")
-        refresh_token = os.environ.get(f"YOUTUBE_REFRESH_TOKEN_{project}", "")
-
-        if not all([client_id, client_secret, refresh_token]):
-            raise ValueError(f"Missing YouTube credentials for project {project}")
+        # FIX: fall back to project A if requested project has no credentials
+        if not self._has_credentials(project):
+            if project != "A" and self._has_credentials("A"):
+                logger.warning(
+                    f"YouTube project {project} credentials not set — "
+                    f"falling back to project A"
+                )
+                project = "A"
+            else:
+                raise ValueError(
+                    f"Missing YouTube credentials for project {project}. "
+                    f"Set YOUTUBE_CLIENT_ID_{project}, YOUTUBE_CLIENT_SECRET_{project}, "
+                    f"and YOUTUBE_REFRESH_TOKEN_{project} in GitHub Secrets."
+                )
 
         creds = Credentials(
             token=None,
-            refresh_token=refresh_token,
-            client_id=client_id,
-            client_secret=client_secret,
+            refresh_token=os.environ[f"YOUTUBE_REFRESH_TOKEN_{project}"],
+            client_id=os.environ[f"YOUTUBE_CLIENT_ID_{project}"],
+            client_secret=os.environ[f"YOUTUBE_CLIENT_SECRET_{project}"],
             token_uri="https://oauth2.googleapis.com/token",
         )
         return build("youtube", "v3", credentials=creds)
@@ -88,8 +105,12 @@ class SocialMCPServer:
                 },
             }
 
-            media = MediaFileUpload(video_path, chunksize=1024 * 1024, resumable=True, mimetype="video/mp4")
-            request = youtube.videos().insert(part=",".join(body.keys()), body=body, media_body=media)
+            media = MediaFileUpload(
+                video_path, chunksize=1024 * 1024, resumable=True, mimetype="video/mp4"
+            )
+            request = youtube.videos().insert(
+                part=",".join(body.keys()), body=body, media_body=media
+            )
 
             response = None
             while response is None:

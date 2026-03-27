@@ -1,116 +1,55 @@
 """
-agents/quality_reviewer.py
-Reviews the final video for basic quality checks before upload.
+agents/social_publisher.py
+Publishes the final video to YouTube with proper metadata.
 """
 import os
-import subprocess
 from loguru import logger
+from mcp_servers.social_server import SocialMCPServer
 
 
-class QualityReviewerAgent:
+class SocialPublisherAgent:
     def __init__(self, config):
         self.config = config
-        self.quality_threshold = config.get("video", {}).get("quality_threshold", 0.75)
+        self.social_server = SocialMCPServer()
+        self.yt_config = config.get("youtube", {})
 
-    def _get_video_info(self, video_path: str) -> dict:
-        try:
-            cmd = [
-                "ffprobe", "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=width,height,r_frame_rate,duration",
-                "-show_entries", "format=duration,size,bit_rate",
-                "-of", "json",
-                video_path,
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            import json
-            data = json.loads(result.stdout)
-            streams = data.get("streams", [{}])
-            fmt = data.get("format", {})
-            stream = streams[0] if streams else {}
+    def run(self, video_path: str, script: dict, video_index: int = 0, *args, **kwargs):
+        logger.info(f"SocialPublisherAgent uploading video: {video_path}")
 
+        if not os.path.exists(video_path):
+            return {"status": "failed", "error": f"Video not found: {video_path}"}
+
+        title = script.get("title", "Amazing Short")[:100]
+        description = script.get("description", "#Shorts")[:5000]
+        tags = script.get("tags", ["shorts", "viral"])
+
+        # Add #Shorts to description for YouTube Shorts detection
+        if "#Shorts" not in description and "#shorts" not in description:
+            description = description + "\n\n#Shorts"
+
+        # Select YouTube project (A or B) alternating by video index
+        project = "A" if video_index % 2 == 0 else "B"
+
+        result = self.social_server.call(
+            "upload_youtube",
+            video_path=video_path,
+            title=title,
+            description=description,
+            tags=tags,
+            category_id=self.yt_config.get("category_id", "22"),
+            privacy=self.yt_config.get("privacy", "public"),
+            made_for_kids=self.yt_config.get("made_for_kids", False),
+            project=project,
+        )
+
+        if result.get("success"):
+            logger.success(f"Published: {result.get('youtube_url')}")
             return {
-                "width": int(stream.get("width", 0)),
-                "height": int(stream.get("height", 0)),
-                "duration": float(fmt.get("duration", 0)),
-                "size_bytes": int(fmt.get("size", 0)),
-                "bit_rate": int(fmt.get("bit_rate", 0)),
+                "status": "published",
+                "youtube_url": result.get("youtube_url"),
+                "youtube_video_id": result.get("video_id"),
+                "simulated": result.get("simulated", False),
             }
-        except Exception as e:
-            logger.warning(f"Could not get video info: {e}")
-            return {}
-
-    def _check_has_audio(self, video_path: str) -> bool:
-        try:
-            cmd = [
-                "ffprobe", "-v", "error",
-                "-select_streams", "a",
-                "-show_entries", "stream=index",
-                "-of", "csv=p=0",
-                video_path
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-            return bool(result.stdout.strip())
-        except Exception:
-            return False
-
-    def run(self, compose_result: dict, script: dict, video_id: str, *args, **kwargs):
-        logger.info(f"QualityReviewerAgent reviewing video: {video_id}")
-
-        video_path = compose_result.get("final_video_path")
-        if not video_path or not os.path.exists(video_path):
-            return {
-                "success": False,
-                "quality_score": 0.0,
-                "passed": False,
-                "issues": ["Video file not found"],
-            }
-
-        issues = []
-        score = 1.0
-        file_size = os.path.getsize(video_path)
-
-        # Check 1: File size (must be > 500KB)
-        if file_size < 500_000:
-            issues.append(f"File too small: {file_size} bytes")
-            score -= 0.4
-
-        # Check 2: Video dimensions and duration
-        info = self._get_video_info(video_path)
-        if info:
-            width = info.get("width", 0)
-            height = info.get("height", 0)
-            duration = info.get("duration", 0)
-
-            if width < 720 or height < 1280:
-                issues.append(f"Low resolution: {width}x{height}")
-                score -= 0.2
-
-            if duration < 10:
-                issues.append(f"Too short: {duration:.1f}s")
-                score -= 0.3
-            elif duration > 180:
-                issues.append(f"Too long: {duration:.1f}s")
-                score -= 0.1
-
-        # Check 3: Has audio track
-        if not self._check_has_audio(video_path):
-            issues.append("No audio track found")
-            score -= 0.3
-
-        score = max(0.0, min(1.0, score))
-        passed = score >= self.quality_threshold and len([i for i in issues if "too small" in i.lower() or "audio" in i.lower()]) == 0
-
-        if passed:
-            logger.success(f"Quality check PASSED: score={score:.2f} for {video_id}")
         else:
-            logger.warning(f"Quality check FAILED: score={score:.2f}, issues={issues}")
-
-        return {
-            "success": True,
-            "quality_score": round(score, 2),
-            "passed": passed,
-            "issues": issues,
-            "video_info": info,
-            "file_size_bytes": file_size,
-        }
+            logger.error(f"Publishing failed: {result.get('error')}")
+            return {"status": "failed", "error": result.get("error")}

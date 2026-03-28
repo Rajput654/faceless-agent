@@ -1,10 +1,14 @@
 video:
-  niche: "${NICHE:-motivation}"   # overridden at runtime by NICHE env var
+  # FIXED: PyYAML does NOT expand "${NICHE:-motivation}" shell syntax — it reads
+  # it as the literal string. main.py resolves the real niche and overwrites this
+  # value at runtime, so changing the default here to "motivation" is safe and
+  # avoids confusing logs like niche='${NICHE:-motivation}'.
+  niche: "motivation"
   daily_count: 10
   duration_seconds: 55
   resolution: "1080x1920"
   fps: 30
-  quality_threshold: 0.70          # lowered slightly so first-run videos pass
+  quality_threshold: 0.70
   max_retries: 3
 
 voice:
@@ -15,14 +19,16 @@ voice:
   volume: "+0%"
 
 llm:
-  primary_model: "llama3-70b-8192"
+  # FIXED: was "llama3-70b-8192" (old model ID) but script_writer.py defaults
+  # to "llama-3.3-70b-versatile". Aligning config with the agent default.
+  primary_model: "llama-3.3-70b-versatile"
   fallback_model: "llama3-8b-8192"
   temperature: 0.8
   max_tokens: 2000
   timeout: 30
 
 images:
-  provider: "pexels_video"         # now tries video clips first
+  provider: "pexels_video"
   style: "cinematic"
   count_per_scene: 1
   width: 1080

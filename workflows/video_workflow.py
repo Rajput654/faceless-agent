@@ -14,9 +14,9 @@ Key changes from original:
      a custom thumbnail image saved alongside the video.
 """
 import os
+from typing import Dict, List, Optional, Literal
 from loguru import logger
 from pydantic import BaseModel
-from typing import Dict, List, Optional, Literal
 
 
 class VideoState(BaseModel):
@@ -24,15 +24,15 @@ class VideoState(BaseModel):
     video_index:       int   = 0
     topic_brief:       Dict  = {}
     script:            Dict  = {}
-    extracted:         Dict  = {}   # NEW: Pass 1 extractor output
+    extracted:         Dict  = {}   # Pass 1 extractor output
     voice_result:      Dict  = {}
     visual_paths:      List[str] = []
-    visual_source:     str   = ""  # NEW: "pollinations_ai" | "pexels_stock" | etc.
-    kb_preset:         str   = "slow_zoom_in"  # NEW: emotion-aware Ken Burns
+    visual_source:     str   = ""  # "pollinations_ai" | "pexels_stock" | etc.
+    kb_preset:         str   = "slow_zoom_in"  # emotion-aware Ken Burns
     music_path:        Optional[str] = None
     caption_result:    Dict  = {}
     final_video_path:  Optional[str] = None
-    thumbnail_path:    Optional[str] = None  # NEW
+    thumbnail_path:    Optional[str] = None
     quality_result:    Dict  = {}
     quality_score:     float = 0.0
     publish_result:    Dict  = {}
@@ -124,7 +124,6 @@ class VideoWorkflow:
             logger.info("Step 3/8: Fetching visuals (scene-matched queries)...")
 
             # Pass the Pass-1 extractor output to VisualDirector
-            # It was stored in script under "_extracted" by ScriptWriterAgent
             extracted = state.script.pop("_extracted", {})
             state.extracted = extracted
 
@@ -132,9 +131,9 @@ class VideoWorkflow:
                 state.script, video_id, self.output_dir,
                 extracted=extracted
             )
-            state.visual_paths = visual_result.get("image_paths", [])
+            state.visual_paths  = visual_result.get("image_paths", [])
             state.visual_source = visual_result.get("source", "unknown")
-            state.kb_preset = visual_result.get("kb_preset", "slow_zoom_in")
+            state.kb_preset     = visual_result.get("kb_preset", "slow_zoom_in")
 
             logger.info(
                 f"Visuals: {len(state.visual_paths)} assets | "
@@ -143,7 +142,7 @@ class VideoWorkflow:
 
             # ── Step 4: Fetch Music ────────────────────────────────────────────
             logger.info("Step 4/8: Fetching music...")
-            music_result   = self.music_director.run(
+            music_result     = self.music_director.run(
                 state.script, video_id, self.output_dir
             )
             state.music_path = music_result.get("music_path")
@@ -168,15 +167,15 @@ class VideoWorkflow:
             state.status = "composing"
             logger.info("Step 7/8: Composing video (emotion-aware KB + SFX + dynamic duck)...")
             compose_result = self.video_composer.run(
-                script        = state.script,
-                voice_result  = state.voice_result,
-                visual_result = {"image_paths": state.visual_paths},
-                caption_result= state.caption_result,
-                music_result  = music_result,
-                video_id      = video_id,
-                output_dir    = self.output_dir,
-                emotion       = emotion,
-                kb_preset     = state.kb_preset,
+                script         = state.script,
+                voice_result   = state.voice_result,
+                visual_result  = {"image_paths": state.visual_paths},
+                caption_result = state.caption_result,
+                music_result   = music_result,
+                video_id       = video_id,
+                output_dir     = self.output_dir,
+                emotion        = emotion,
+                kb_preset      = state.kb_preset,
             )
             state.final_video_path = compose_result.get("final_video_path")
 
@@ -231,31 +230,28 @@ class VideoWorkflow:
     def _generate_thumbnail(self, script: dict, video_id: str, output_dir: str) -> Optional[str]:
         """
         Generate a custom thumbnail using Pollinations AI.
-        Prompt = hook + niche style + thumbnail composition rules.
         Saves as {video_id}_thumbnail.jpg (1280x720 landscape).
         """
         try:
             import requests
             import urllib.parse
 
-            hook  = script.get("hook", "")
-            title = script.get("title", "")
-            niche = os.environ.get("NICHE", "motivation")
+            hook    = script.get("hook", "")
+            title   = script.get("title", "")
+            niche   = os.environ.get("NICHE", "motivation")
             emotion = script.get("emotion", "curiosity")
 
-            # Build thumbnail prompt
             thumbnail_styles = {
-                "motivation": "dramatic lighting, golden hour, inspirational, person achieving goal",
-                "horror":     "dark atmospheric, horror movie poster style, eerie shadows",
+                "motivation":   "dramatic lighting, golden hour, inspirational, person achieving goal",
+                "horror":       "dark atmospheric, horror movie poster style, eerie shadows",
                 "reddit_story": "realistic dramatic moment, candid shocked expression",
-                "brainrot":   "colorful neon chaos, surreal internet aesthetic",
-                "finance":    "clean professional, money concept, charts, business",
+                "brainrot":     "colorful neon chaos, surreal internet aesthetic",
+                "finance":      "clean professional, money concept, charts, business",
             }
             style = thumbnail_styles.get(niche, "cinematic, dramatic lighting")
 
-            # Use hook keywords as subject
             hook_words = " ".join(hook.split()[:6]) if hook else title[:40]
-            prompt = f"{hook_words}, {style}, thumbnail composition, high contrast, 4K"
+            prompt     = f"{hook_words}, {style}, thumbnail composition, high contrast, 4K"
 
             encoded = urllib.parse.quote(prompt)
             url = (

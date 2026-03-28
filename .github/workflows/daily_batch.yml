@@ -2,7 +2,7 @@ name: Daily Faceless Video Batch
 
 on:
   schedule:
-    - cron: '0 6 * * *'   # 6:00 AM UTC daily
+    - cron: '0 6 * * *'
   workflow_dispatch:
     inputs:
       video_count:
@@ -13,6 +13,13 @@ on:
         description: 'Content niche'
         required: false
         default: 'motivation'
+        type: choice
+        options:
+          - motivation
+          - horror
+          - reddit_story
+          - brainrot
+          - finance
 
 env:
   PYTHON_VERSION: '3.11'
@@ -27,12 +34,38 @@ jobs:
       topics_count: ${{ steps.research.outputs.topics_count }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
-      - run: pip install -r requirements.txt
-      - run: playwright install chromium --with-deps
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright
+        run: playwright install chromium --with-deps
+
+      # ── Download Kokoro TTS model files (cached between runs) ──────────────
+      - name: Cache Kokoro model files
+        id: cache-kokoro
+        uses: actions/cache@v4
+        with:
+          path: |
+            kokoro-v1.0.onnx
+            voices.bin
+          key: kokoro-models-v1
+
+      - name: Download Kokoro model files (if not cached)
+        if: steps.cache-kokoro.outputs.cache-hit != 'true'
+        run: |
+          echo "Downloading Kokoro model files (~300 MB)…"
+          curl -L -o kokoro-v1.0.onnx \
+            "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files/kokoro-v1.0.onnx"
+          curl -L -o voices.bin \
+            "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files/voices.bin"
+          ls -lh kokoro-v1.0.onnx voices.bin
+
       - name: Run Research Scout
         id: research
         env:
@@ -41,13 +74,23 @@ jobs:
           REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
           NICHE: ${{ env.NICHE }}
         run: |
-          python main.py --mode research --topics-file topics.json
+          python main.py --mode research --niche "$NICHE" --topics-file topics.json
           COUNT=$(python -c "import json; print(len(json.load(open('topics.json'))))")
           echo "topics_count=$COUNT" >> $GITHUB_OUTPUT
+
       - uses: actions/upload-artifact@v4
         with:
           name: topics-queue
           path: topics.json
+          retention-days: 1
+
+      # Upload cached Kokoro models as artifact so video jobs don't re-download
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kokoro-models
+          path: |
+            kokoro-v1.0.onnx
+            voices.bin
           retention-days: 1
 
   generate-videos:
@@ -56,9 +99,10 @@ jobs:
     needs: research
     strategy:
       fail-fast: false
-      max-parallel: 10
+      max-parallel: 5
       matrix:
         video_index: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
     steps:
       - uses: actions/checkout@v4
 
@@ -72,7 +116,6 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg
           ffmpeg -version | head -1
-          ffprobe -version | head -1
 
       - name: Install Python dependencies
         run: pip install -r requirements.txt
@@ -81,41 +124,38 @@ jobs:
         with:
           name: topics-queue
 
+      # Download the pre-fetched Kokoro models (avoids 300 MB re-download per job)
+      - uses: actions/download-artifact@v4
+        with:
+          name: kokoro-models
+
+      - name: Verify Kokoro models present
+        run: |
+          ls -lh kokoro-v1.0.onnx voices.bin
+          echo "Kokoro models ready ✅"
+
       - name: Verify environment
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
         run: |
-          echo "=== Topics file ==="
+          echo "=== Topics ==="
           python -c "
-          import json
+          import json, sys
           t = json.load(open('topics.json'))
-          print(f'Topics loaded: {len(t)}')
           idx = ${{ matrix.video_index }}
-          if idx < len(t):
-              print(f'Topic [{idx}]: {t[idx].get(\"topic\", \"?\")}')
-          else:
-              print(f'ERROR: index {idx} out of range (only {len(t)} topics)')
-              exit(1)
+          if idx >= len(t):
+              print(f'ERROR: index {idx} >= {len(t)} topics')
+              sys.exit(1)
+          print(f'Topic [{idx}]: {t[idx].get(\"topic\", \"?\")}')
           "
           echo ""
           echo "=== Key checks ==="
           echo "NICHE: ${{ env.NICHE }}"
-          echo "Video index: ${{ matrix.video_index }}"
-          [ -n "$GROQ_API_KEY" ]   && echo "✅ GROQ_API_KEY is set"   || echo "❌ GROQ_API_KEY is MISSING"
-          [ -n "$PEXELS_API_KEY" ] && echo "✅ PEXELS_API_KEY is set" || echo "⚠️  PEXELS_API_KEY not set (will use Pollinations fallback)"
-          which ffmpeg  && echo "✅ ffmpeg found"  || echo "❌ ffmpeg MISSING"
-          which ffprobe && echo "✅ ffprobe found" || echo "❌ ffprobe MISSING"
-
-          echo ""
-          echo "=== edge-tts smoke test ==="
-          python -c "
-          import edge_tts
-          print(f'edge-tts version: {getattr(edge_tts, \"__version__\", \"unknown\")}')
-          sm = edge_tts.SubMaker()
-          methods = [m for m in dir(sm) if not m.startswith('_')]
-          print(f'SubMaker methods: {methods}')
-          "
+          [ -n "$GROQ_API_KEY"   ] && echo "✅ GROQ_API_KEY"   || echo "❌ GROQ_API_KEY MISSING"
+          [ -n "$PEXELS_API_KEY" ] && echo "✅ PEXELS_API_KEY" || echo "⚠️  PEXELS_API_KEY not set"
+          which ffmpeg  && echo "✅ ffmpeg"  || echo "❌ ffmpeg MISSING"
+          which ffprobe && echo "✅ ffprobe" || echo "❌ ffprobe MISSING"
 
       - name: Generate Video
         env:
@@ -125,57 +165,42 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           NICHE: ${{ env.NICHE }}
-        # FIX: use set -o pipefail so Python errors aren't masked, and
-        # run with unbuffered output (-u) so logs appear in real time
         run: |
           VIDEO_ID="video_$(printf '%03d' ${{ matrix.video_index }})"
-          echo "Starting generation for: $VIDEO_ID"
+          echo "Starting generation for: $VIDEO_ID (niche: $NICHE)"
           set -o pipefail
           python -u main.py \
             --mode single \
+            --niche "$NICHE" \
             --video-id "$VIDEO_ID" \
             --video-index ${{ matrix.video_index }} \
             --topics-file topics.json \
             --no-upload
-          # main.py now calls sys.exit(1) on pipeline failure,
-          # so a non-zero exit here means something real went wrong.
 
-      # Always runs — shows exactly what was/wasn't created
       - name: Debug output files
         if: always()
         run: |
-          echo "=== All files in /tmp ==="
-          ls -lh /tmp/ 2>/dev/null || echo "/tmp is empty"
-          echo ""
           echo "=== MP4 files ==="
           find /tmp -name "*.mp4" -exec ls -lh {} \; 2>/dev/null || echo "None"
-          echo "=== MP3 files (voice) ==="
+          echo "=== MP3 files ==="
           find /tmp -name "*.mp3" -exec ls -lh {} \; 2>/dev/null || echo "None"
-          echo "=== JPG files (images) ==="
-          find /tmp -name "*.jpg" -exec ls -lh {} \; 2>/dev/null || echo "None"
-          echo "=== SRT/ASS files (captions) ==="
-          find /tmp \( -name "*.srt" -o -name "*.ass" \) -exec ls -lh {} \; 2>/dev/null || echo "None"
 
-      - name: Set video path env var
+      - name: Verify video file
         run: |
-          echo "VIDEO_PATH=/tmp/video_$(printf '%03d' ${{ matrix.video_index }})_final.mp4" >> $GITHUB_ENV
-
-      - name: Verify video file exists
-        run: |
-          if [ ! -f "${{ env.VIDEO_PATH }}" ]; then
-            echo "❌ Video file not found at ${{ env.VIDEO_PATH }}"
-            echo "Files in /tmp:"
-            ls -lh /tmp/
+          VIDEO_PATH="/tmp/video_$(printf '%03d' ${{ matrix.video_index }})_final.mp4"
+          if [ ! -f "$VIDEO_PATH" ]; then
+            echo "❌ Video not found: $VIDEO_PATH"
+            ls -lh /tmp/ 2>/dev/null || true
             exit 1
           fi
-          SIZE=$(stat -c%s "${{ env.VIDEO_PATH }}")
-          echo "✅ Found ${{ env.VIDEO_PATH }} ($SIZE bytes)"
+          SIZE=$(stat -c%s "$VIDEO_PATH")
+          echo "✅ $VIDEO_PATH ($SIZE bytes)"
 
       - uses: actions/upload-artifact@v4
         if: success()
         with:
           name: video-${{ matrix.video_index }}
-          path: ${{ env.VIDEO_PATH }}
+          path: /tmp/video_${{ matrix.video_index }}_final.mp4
           retention-days: 1
 
   upload-youtube:
@@ -193,30 +218,19 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
-      # Install full requirements so upload.py can import yaml, loguru, etc.
       - run: pip install -r requirements.txt
+
       - uses: actions/download-artifact@v4
         with:
           name: video-${{ matrix.video_index }}
           path: /tmp/
+
       - uses: actions/download-artifact@v4
         with:
           name: topics-queue
 
-      - name: Verify video file exists
-        run: |
-          VIDEO_ID="video_$(printf '%03d' ${{ matrix.video_index }})"
-          VIDEO_PATH="/tmp/${VIDEO_ID}_final.mp4"
-          if [ ! -f "$VIDEO_PATH" ]; then
-            echo "❌ Video file not found at $VIDEO_PATH"
-            ls /tmp/*.mp4 2>/dev/null || echo "No mp4 files in /tmp"
-            exit 1
-          fi
-          SIZE=$(stat -c%s "$VIDEO_PATH")
-          echo "✅ Found $VIDEO_PATH ($SIZE bytes)"
-
-      - name: Stagger Upload (avoid quota burst)
-        run: sleep $(( ${{ matrix.video_index }} * 60 ))
+      - name: Stagger uploads (avoid quota burst)
+        run: sleep $(( ${{ matrix.video_index }} * 90 ))
 
       - name: Upload to YouTube
         env:

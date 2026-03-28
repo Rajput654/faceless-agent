@@ -8,11 +8,19 @@ groq>=0.13.0
 google-generativeai>=0.8.3
 
 # --- TTS BACKENDS ---
-# Kokoro: near-human quality, Apache 2.0, auto-downloads model files
+# Chatterbox: near-human quality, MIT license, beats ElevenLabs in blind tests
+# emotion control via exps parameter (0.0-2.0), zero-shot voice cloning
+chatterbox-tts>=0.1.0
+torch>=2.0.0
+torchaudio>=2.0.0
+
+# Kokoro: fast, Apache 2.0, good fallback
 kokoro-onnx>=0.4.0
 soundfile>=0.12.1
-# edge-tts: Microsoft Neural voices, human-sounding, works locally
+
+# edge-tts: Microsoft Neural voices
 edge-tts>=6.1.12
+
 # gTTS: last-resort fallback only
 gtts>=2.5.1
 mutagen>=1.47.0

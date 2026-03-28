@@ -11,8 +11,15 @@ google-generativeai>=0.8.3
 # Chatterbox: near-human quality, MIT license, beats ElevenLabs in blind tests
 # emotion control via exps parameter (0.0-2.0), zero-shot voice cloning
 chatterbox-tts>=0.1.0
-torch>=2.0.0
-torchaudio>=2.0.0
+
+# FIX: pin torch to CPU-only wheel — avoids 2GB+ CUDA download on GitHub Actions
+# and prevents pandas version backtracking caused by gradio's loose pandas>=1.0 bound
+torch>=2.0.0,<3.0.0 --index-url https://download.pytorch.org/whl/cpu
+torchaudio>=2.0.0,<3.0.0 --index-url https://download.pytorch.org/whl/cpu
+
+# FIX: pin pandas to a modern pre-built wheel — prevents pip from backtracking
+# to pandas 1.4.4 (source-only, fails to build on Python 3.11 without pkg_resources)
+pandas>=2.2.2,<3.0.0
 
 # Kokoro: fast, Apache 2.0, good fallback
 kokoro-onnx>=0.4.0

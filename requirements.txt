@@ -8,11 +8,14 @@ groq>=0.13.0
 google-generativeai>=0.8.3
 
 # --- TTS BACKENDS ---
+# Kokoro: near-human quality, Apache 2.0, auto-downloads model files
 kokoro-onnx>=0.4.0
 soundfile>=0.12.1
+# edge-tts: Microsoft Neural voices, human-sounding, works locally
+edge-tts>=6.1.12
+# gTTS: last-resort fallback only
 gtts>=2.5.1
 mutagen>=1.47.0
-edge-tts>=6.1.12
 
 # --- VIDEO / AUDIO ---
 ffmpeg-python>=0.2.0
@@ -20,9 +23,9 @@ Pillow>=11.0.0
 pydub>=0.25.1
 
 # --- HTTP / SCRAPING ---
-requests>=2.31.0       # Loosened
-aiohttp>=3.10.0        # Loosened
-aiofiles>=23.2.0       # Loosened
+requests>=2.31.0
+aiohttp>=3.10.0
+aiofiles>=23.2.0
 beautifulsoup4>=4.12.0
 playwright>=1.49.0
 praw>=7.7.0
@@ -34,14 +37,14 @@ google-auth-httplib2>=0.2.0
 
 # --- DB / CONFIG ---
 supabase>=2.10.0
-pydantic>=2.9.0,<3.0.0 # Unpinned the exact patch, kept it in v2
+pydantic>=2.9.0,<3.0.0
 python-dotenv>=1.0.0
 PyYAML>=6.0.0
 
 # --- UTILITY / OBSERVABILITY ---
-tenacity>=8.4.0        # Loosened (allows fallback to 8.x if 9.0 breaks Langchain)
+tenacity>=8.4.0
 loguru>=0.7.0
-httpx>=0.27.0          # Removed the strict upper bound constraint
+httpx>=0.27.0
 langfuse>=2.57.2
 
 # --- TESTING ---

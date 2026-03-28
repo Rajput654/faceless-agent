@@ -40,21 +40,25 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
 
-      # FIX: pre-install numpy and setuptools BEFORE requirements.txt
-      # pkuseg (pulled by chatterbox-tts) needs numpy at build time,
-      # and setuptools needs pkg_resources to be present for legacy packages.
+      # FIX 1: upgrade pip and pre-install build deps BEFORE requirements.txt
+      # numpy must exist before any source package tries to use it at build time.
       - name: Pre-install build dependencies
         run: |
           pip install --upgrade pip setuptools wheel
           pip install "numpy>=1.26.0,<3.0.0"
 
+      # FIX 2: install requirements with pip's new resolver and a higher backtrack limit
+      # --use-pep517 forces wheel builds, avoiding legacy setup.py issues
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install \
+            --use-pep517 \
+            --resolver=backtracking \
+            -r requirements.txt
 
       - name: Install Playwright
         run: playwright install chromium --with-deps
 
-      # ── Download Kokoro TTS model files (cached between runs) ──────────────
       - name: Cache Kokoro model files
         id: cache-kokoro
         uses: actions/cache@v4
@@ -67,7 +71,6 @@ jobs:
       - name: Download Kokoro model files (if not cached)
         if: steps.cache-kokoro.outputs.cache-hit != 'true'
         run: |
-          echo "Downloading Kokoro model files (~300 MB)…"
           curl -L -o kokoro-v1.0.onnx \
             "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files/kokoro-v1.0.onnx"
           curl -L -o voices.bin \
@@ -92,7 +95,6 @@ jobs:
           path: topics.json
           retention-days: 1
 
-      # Upload cached Kokoro models as artifact so video jobs don't re-download
       - uses: actions/upload-artifact@v4
         with:
           name: kokoro-models
@@ -125,20 +127,22 @@ jobs:
           sudo apt-get install -y ffmpeg
           ffmpeg -version | head -1
 
-      # FIX: pre-install numpy and setuptools BEFORE requirements.txt
       - name: Pre-install build dependencies
         run: |
           pip install --upgrade pip setuptools wheel
           pip install "numpy>=1.26.0,<3.0.0"
 
       - name: Install Python dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install \
+            --use-pep517 \
+            --resolver=backtracking \
+            -r requirements.txt
 
       - uses: actions/download-artifact@v4
         with:
           name: topics-queue
 
-      # Download the pre-fetched Kokoro models (avoids 300 MB re-download per job)
       - uses: actions/download-artifact@v4
         with:
           name: kokoro-models
@@ -163,8 +167,6 @@ jobs:
               sys.exit(1)
           print(f'Topic [{idx}]: {t[idx].get(\"topic\", \"?\")}')
           "
-          echo ""
-          echo "=== Key checks ==="
           echo "NICHE: ${{ env.NICHE }}"
           [ -n "$GROQ_API_KEY"   ] && echo "✅ GROQ_API_KEY"   || echo "❌ GROQ_API_KEY MISSING"
           [ -n "$PEXELS_API_KEY" ] && echo "✅ PEXELS_API_KEY" || echo "⚠️  PEXELS_API_KEY not set"
@@ -194,9 +196,7 @@ jobs:
       - name: Debug output files
         if: always()
         run: |
-          echo "=== MP4 files ==="
           find /tmp -name "*.mp4" -exec ls -lh {} \; 2>/dev/null || echo "None"
-          echo "=== MP3 files ==="
           find /tmp -name "*.mp3" -exec ls -lh {} \; 2>/dev/null || echo "None"
 
       - name: Verify video file
@@ -228,18 +228,23 @@ jobs:
         video_index: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
 
-      # FIX: pre-install numpy and setuptools BEFORE requirements.txt
       - name: Pre-install build dependencies
         run: |
           pip install --upgrade pip setuptools wheel
           pip install "numpy>=1.26.0,<3.0.0"
 
-      - run: pip install -r requirements.txt
+      - name: Install dependencies
+        run: |
+          pip install \
+            --use-pep517 \
+            --resolver=backtracking \
+            -r requirements.txt
 
       - uses: actions/download-artifact@v4
         with:

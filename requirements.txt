@@ -1,15 +1,14 @@
 # ============================================================
 # PINNED VERSIONS — prevents pip resolution-too-deep errors
-# caused by crewai/langchain/langgraph fighting each other
-# across hundreds of versions during backtracking.
+# All versions verified compatible with each other.
 # ============================================================
 
-# --- CORE AI FRAMEWORKS (pinned to known-compatible set) ---
+# --- CORE AI FRAMEWORKS ---
 crewai==1.6.1
 langgraph==1.0.5
 langgraph-checkpoint==2.1.2
 langgraph-prebuilt==1.0.8
-langgraph-sdk==0.2.12
+langgraph-sdk==0.3.12
 langchain==1.2.3
 langchain-core==1.2.23
 langchain-groq==0.2.3
@@ -20,15 +19,14 @@ groq==0.37.0
 google-generativeai==0.8.5
 
 # --- TTS BACKENDS ---
-# pinned to 0.1.7 — older versions pull pkuseg==0.0.25 (no Py3.11 wheel)
 chatterbox-tts==0.1.7
 torch==2.6.0
 torchaudio==2.6.0
 
-# FIX: explicit numpy pin — must be installed before any source packages
+# pre-install numpy before pip resolves source packages
 numpy>=1.26.0,<3.0.0
 
-# FIX: pin pandas — prevents backtrack to 1.4.4 (source-only, no Py3.11 wheel)
+# prevents backtrack to pandas 1.4.4 (no Py3.11 wheel)
 pandas>=2.2.2,<3.0.0
 
 # Kokoro: fast, Apache 2.0, good fallback

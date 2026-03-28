@@ -1,6 +1,8 @@
 # ============================================================
-# PINNED VERSIONS — prevents pip resolution-too-deep errors
-# All versions verified compatible with each other.
+# PINNED VERSIONS — verified compatible set
+# Key insight: langchain-groq 0.2.x caps langchain-core<0.4.0
+# but langchain 1.2.x needs langchain-core>=1.2.1
+# Solution: use langchain-groq>=1.x which accepts langchain-core>=1.x
 # ============================================================
 
 # --- CORE AI FRAMEWORKS ---
@@ -11,7 +13,7 @@ langgraph-prebuilt==1.0.8
 langgraph-sdk==0.3.12
 langchain==1.2.3
 langchain-core==1.2.23
-langchain-groq==0.2.3
+langchain-groq==1.1.2
 langchain-community==0.3.10
 langchain-classic==1.0.2
 langchain-text-splitters==1.1.1

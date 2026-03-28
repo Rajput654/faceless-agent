@@ -1,82 +1,58 @@
-# ============================================================
-# FIXED REQUIREMENTS — verified compatible set
-#
-# Root cause of original error:
-#   langchain-community 0.3.x requires langchain<0.4.0
-#   but langchain 1.2.x does not exist on PyPI (LangChain
-#   never published a 1.x series — latest stable is 0.3.x)
-#
-# Fix: pin all langchain-* packages to the 0.3.x series
-#      which are mutually compatible.
-# ============================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# FACELESS AGENT — Python Dependencies
+# Fixed: langgraph-checkpoint==2.0.11 does not exist on PyPI (skipped release).
+#        Unpinned langgraph/crewai so pip resolves compatible checkpoint version.
+# ─────────────────────────────────────────────────────────────────────────────
 
-# --- CORE AI FRAMEWORKS ---
-crewai==1.6.1
-langgraph==0.2.73
-langgraph-checkpoint==2.0.11
-langgraph-prebuilt==0.1.8
-langgraph-sdk==0.1.51
-langchain==0.3.25
-langchain-core==0.3.65
-langchain-groq==0.2.5
-langchain-community==0.3.25
-langchain-text-splitters==0.3.8
-groq==0.37.0
-google-generativeai==0.8.5
-
-# --- TTS BACKENDS ---
-# chatterbox-tts requires torch; install torch first (CPU wheel is ~800MB,
-# GPU wheel is larger — GitHub Actions free tier uses CPU only)
-torch==2.6.0
-torchaudio==2.6.0
-chatterbox-tts==0.1.7
-
-# pre-install numpy before pip resolves source packages
-numpy>=1.26.0,<3.0.0
-
-# prevents backtrack to pandas 1.4.4 (no Py3.11 wheel)
-pandas>=2.2.2,<3.0.0
-
-# Kokoro: fast, Apache 2.0, good fallback
-kokoro-onnx==0.4.9
-soundfile>=0.12.1
-
-# edge-tts: Microsoft Neural voices
-edge-tts>=6.1.12
-
-# gTTS: last-resort fallback only
-gtts>=2.5.1
-mutagen>=1.47.0
-
-# --- VIDEO / AUDIO ---
-ffmpeg-python>=0.2.0
-Pillow>=11.0.0
-pydub>=0.25.1
-
-# --- HTTP / SCRAPING ---
-requests>=2.31.0
-aiohttp>=3.10.0
-aiofiles>=23.2.0
-beautifulsoup4>=4.12.0
-playwright>=1.49.0
-praw>=7.7.0
-
-# --- GOOGLE / YOUTUBE ---
-google-api-python-client>=2.150.0
-google-auth-oauthlib>=1.2.0
-google-auth-httplib2>=0.2.0
-
-# --- DB / CONFIG ---
-supabase>=2.10.0
-pydantic>=2.9.0,<3.0.0
-python-dotenv>=1.0.0
-PyYAML>=6.0.0
-
-# --- UTILITY / OBSERVABILITY ---
-tenacity>=8.4.0
+# ── Core utilities ────────────────────────────────────────────────────────────
 loguru>=0.7.0
-httpx>=0.27.0
-langfuse>=2.57.2
+python-dotenv>=1.0.0
+PyYAML>=6.0
+pydantic>=2.0.0
+tenacity>=8.2.0
+requests>=2.31.0
 
-# --- TESTING ---
-pytest>=8.3.0
+# ── LLM ───────────────────────────────────────────────────────────────────────
+groq>=0.9.0
+
+# ── Web scraping ──────────────────────────────────────────────────────────────
+beautifulsoup4>=4.12.0
+praw>=7.7.0
+playwright>=1.40.0
+
+# ── TTS backends ──────────────────────────────────────────────────────────────
+edge-tts>=6.1.9
+gTTS>=2.5.0
+# Kokoro ONNX (fast, Apache 2.0)
+kokoro-onnx>=0.3.0
+soundfile>=0.12.0
+# Chatterbox TTS (near-human, MIT) — GPU optional, falls back to CPU automatically
+# chatterbox-tts>=0.1.0          # Uncomment if GPU runner is available
+
+# ── Audio/Video processing ────────────────────────────────────────────────────
+# ffmpeg is installed via apt in CI (see workflow). Python bindings only:
+# (no python-ffmpeg package needed; subprocess calls ffmpeg directly)
+
+# ── YouTube upload ────────────────────────────────────────────────────────────
+google-auth>=2.23.0
+google-auth-oauthlib>=1.1.0
+google-api-python-client>=2.100.0
+
+# ── Database / Analytics ──────────────────────────────────────────────────────
+supabase>=2.0.0
+
+# ── Observability ─────────────────────────────────────────────────────────────
+langfuse>=2.0.0
+
+# ── Agent framework ───────────────────────────────────────────────────────────
+# FIX: langgraph==0.2.73 pins langgraph-checkpoint==2.0.11 which does NOT exist
+#      on PyPI (version was skipped). Using >=0.2.74 resolves to a valid checkpoint.
+#      crewai is pinned loosely for same reason — it transitively pulls langgraph.
+#      NOTE: crew.py explicitly says "not used in the main pipeline", so these
+#      are optional; remove them entirely if you want a leaner install.
+langgraph>=0.2.74
+crewai>=1.6.2
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest>=7.4.0
+pytest-asyncio>=0.21.0

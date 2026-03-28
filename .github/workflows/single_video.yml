@@ -28,41 +28,101 @@ jobs:
   generate:
     name: Generate & Upload Single Short
     runs-on: ubuntu-latest
+    env:
+      NICHE: ${{ github.event.inputs.niche }}
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
-      - run: pip install -r requirements.txt && playwright install chromium --with-deps
-      - name: Research or Use Custom Topic
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt && playwright install chromium --with-deps
+
+      # ── Kokoro TTS model (cached) ──────────────────────────────────────────
+      - name: Cache Kokoro model files
+        id: cache-kokoro
+        uses: actions/cache@v4
+        with:
+          path: |
+            kokoro-v1.0.onnx
+            voices.bin
+          key: kokoro-models-v1
+
+      - name: Download Kokoro model files (if not cached)
+        if: steps.cache-kokoro.outputs.cache-hit != 'true'
+        run: |
+          curl -L -o kokoro-v1.0.onnx \
+            "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files/kokoro-v1.0.onnx"
+          curl -L -o voices.bin \
+            "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files/voices.bin"
+          ls -lh kokoro-v1.0.onnx voices.bin
+
+      # ── Research / use custom topic ────────────────────────────────────────
+      - name: Research or use custom topic
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
           REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
-          NICHE: ${{ github.event.inputs.niche }}
+          NICHE: ${{ env.NICHE }}
         run: |
           if [ -n "${{ github.event.inputs.topic }}" ]; then
-            echo '[{"topic":"${{ github.event.inputs.topic }}",
-              "hook":"You need to hear this...",
-              "angle":"Unique perspective",
-              "virality_score":8,
-              "emotion":"curiosity",
-              "source":"manual"}]' > topics.json
+            python -c "
+          import json
+          topic = '${{ github.event.inputs.topic }}'
+          topics = [{
+              'topic': topic,
+              'hook': 'You need to hear this...',
+              'angle': 'Unique perspective',
+              'virality_score': 8,
+              'emotion': 'curiosity',
+              'source': 'manual'
+          }]
+          json.dump(topics, open('topics.json','w'), indent=2)
+          print(f'Custom topic saved: {topic}')
+          "
           else
-            python main.py --mode research --topics-file topics.json
+            python main.py --mode research --niche "$NICHE" --topics-file topics.json
           fi
-      - name: Generate Video
+
+      # ── Generate video ─────────────────────────────────────────────────────
+      - name: Generate video
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
-          NICHE: ${{ github.event.inputs.niche }}
+          NICHE: ${{ env.NICHE }}
         run: |
-          python main.py --mode single --video-id manual_001 \
-            --video-index 0 --topics-file topics.json --no-upload
+          set -o pipefail
+          UPLOAD_FLAG=""
+          if [ "${{ github.event.inputs.upload }}" = "true" ]; then
+            UPLOAD_FLAG=""
+          else
+            UPLOAD_FLAG="--no-upload"
+          fi
+          python -u main.py \
+            --mode single \
+            --niche "$NICHE" \
+            --video-id manual_001 \
+            --video-index 0 \
+            --topics-file topics.json \
+            $UPLOAD_FLAG
+
+      - name: Debug outputs
+        if: always()
+        run: |
+          find /tmp -name "*.mp4" -exec ls -lh {} \; 2>/dev/null || echo "No MP4 files"
+
       - uses: actions/upload-artifact@v4
         with:
-          name: generated-short
+          name: generated-short-${{ github.event.inputs.niche }}
           path: /tmp/manual_001_final.mp4
           retention-days: 7

@@ -51,10 +51,7 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          pip install \
-            --use-pep517 \
-            --resolver=backtracking \
-            -r requirements.txt
+          pip install -r requirements.txt
           playwright install chromium --with-deps
 
       - name: Cache Kokoro model files
@@ -86,14 +83,7 @@ jobs:
             python -c "
           import json
           topic = '${{ github.event.inputs.topic }}'
-          topics = [{
-              'topic': topic,
-              'hook': 'You need to hear this...',
-              'angle': 'Unique perspective',
-              'virality_score': 8,
-              'emotion': 'curiosity',
-              'source': 'manual'
-          }]
+          topics = [{'topic': topic, 'hook': 'You need to hear this...', 'angle': 'Unique perspective', 'virality_score': 8, 'emotion': 'curiosity', 'source': 'manual'}]
           json.dump(topics, open('topics.json','w'), indent=2)
           print(f'Custom topic saved: {topic}')
           "
@@ -110,9 +100,7 @@ jobs:
         run: |
           set -o pipefail
           UPLOAD_FLAG=""
-          if [ "${{ github.event.inputs.upload }}" = "true" ]; then
-            UPLOAD_FLAG=""
-          else
+          if [ "${{ github.event.inputs.upload }}" != "true" ]; then
             UPLOAD_FLAG="--no-upload"
           fi
           python -u main.py \
@@ -125,8 +113,7 @@ jobs:
 
       - name: Debug outputs
         if: always()
-        run: |
-          find /tmp -name "*.mp4" -exec ls -lh {} \; 2>/dev/null || echo "No MP4 files"
+        run: find /tmp -name "*.mp4" -exec ls -lh {} \; 2>/dev/null || echo "No MP4 files"
 
       - uses: actions/upload-artifact@v4
         with:

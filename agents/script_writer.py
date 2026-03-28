@@ -62,13 +62,11 @@ NICHE_SYSTEM_PROMPTS = {
     ),
 }
 
-# Pass 1 system prompt — same for all niches
 EXTRACTOR_SYSTEM = (
     "You are a story analyst. Your job is to extract the raw emotional core from a topic brief. "
     "Be ruthlessly concise. Return only a JSON object, no markdown, no preamble."
 )
 
-# Pass 3 system prompt — same for all niches
 HOOK_SHARPENER_SYSTEM = (
     "You are a master of opening lines. Your only job is to rewrite the first sentence of a "
     "script to be more visceral, specific, and impossible to scroll past. "
@@ -77,6 +75,20 @@ HOOK_SHARPENER_SYSTEM = (
     "Return ONLY the improved opening sentence. Nothing else. No quotes around it."
 )
 
+# Emotion → Ken Burns preset mapping so VisualDirector and VideoComposer
+# get the right motion even when called from the script layer.
+EMOTION_KB_PRESET = {
+    "inspiration": "slow_zoom_in",
+    "urgency":     "fast_zoom_in",
+    "fear":        "slow_zoom_out",
+    "dread":       "slow_zoom_out",
+    "shock":       "fast_zoom_out",
+    "curiosity":   "slow_pan_right",
+    "amusement":   "fast_pan_left",
+    "chaos":       "fast_pan_left",
+    "default":     "slow_zoom_in",
+}
+
 
 class ScriptWriterAgent:
     def __init__(self, config):
@@ -84,7 +96,6 @@ class ScriptWriterAgent:
         self.niche = os.environ.get("NICHE", config.get("video", {}).get("niche", "motivation"))
         self.groq_key = os.environ.get("GROQ_API_KEY", "")
         self.template = self._load_template()
-        # Sleep duration between Groq calls to respect free-tier rate limits
         self._inter_call_sleep = float(os.environ.get("GROQ_SLEEP_SECONDS", "12"))
 
     def _load_template(self):
@@ -94,15 +105,14 @@ class ScriptWriterAgent:
                 return yaml.safe_load(f)
         return {
             "niche": self.niche,
-            "system_prompt": NICHE_SYSTEM_PROMPTS.get(self.niche, f"You write engaging YouTube Shorts scripts for {self.niche} content."),
+            "system_prompt": NICHE_SYSTEM_PROMPTS.get(
+                self.niche, f"You write engaging YouTube Shorts scripts for {self.niche} content."
+            ),
             "tone": "engaging",
             "avg_words_per_second": 2.5,
             "hook_patterns": ["Nobody told you this about [topic]..."],
         }
 
-    # ------------------------------------------------------------------
-    # Core LLM caller — shared by all three passes
-    # ------------------------------------------------------------------
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=15))
     def _call_llm(self, prompt: str, system_prompt: str, model: str = None, max_tokens: int = None) -> str:
         if not Groq or not self.groq_key:
@@ -125,8 +135,6 @@ class ScriptWriterAgent:
 
     # ------------------------------------------------------------------
     # PASS 1 — EXTRACTOR
-    # Pulls the emotional core, key tension, and 3 most surprising facts
-    # from the raw topic brief.
     # ------------------------------------------------------------------
     def _pass1_extract(self, topic_brief: dict) -> dict:
         logger.info("  [Pass 1/3] Extracting emotional core...")
@@ -169,7 +177,6 @@ Return ONLY this JSON object (no markdown):
 
     # ------------------------------------------------------------------
     # PASS 2 — SCRIPTWRITER
-    # Uses the extracted core to write a full structured script.
     # ------------------------------------------------------------------
     def _pass2_write_script(self, topic_brief: dict, extracted: dict, video_id: str) -> dict:
         logger.info("  [Pass 2/3] Writing full script...")
@@ -186,15 +193,20 @@ Return ONLY this JSON object (no markdown):
         hook_patterns = self.template.get("hook_patterns", [])
         hook_hint = hook_patterns[0] if hook_patterns else topic_brief.get("hook", "")
 
+        key_facts = extracted.get("key_facts", ["", "", ""])
+        fact1 = key_facts[0] if len(key_facts) > 0 else ""
+        fact2 = key_facts[1] if len(key_facts) > 1 else ""
+        fact3 = key_facts[2] if len(key_facts) > 2 else ""
+
         prompt = f"""Write a YouTube Shorts script using this storytelling brief:
 
 TOPIC: {topic_brief.get('topic', '')}
 CORE MYSTERY: {extracted.get('core_mystery', '')}
 EMOTIONAL TRIGGER: {extracted.get('emotional_trigger', '')}
 KEY FACTS TO WEAVE IN:
-  - {extracted.get('key_facts', [''])[0]}
-  - {extracted.get('key_facts', ['', ''])[1] if len(extracted.get('key_facts', [])) > 1 else ''}
-  - {extracted.get('key_facts', ['', '', ''])[2] if len(extracted.get('key_facts', [])) > 2 else ''}
+  - {fact1}
+  - {fact2}
+  - {fact3}
 TENSION ARC: {extracted.get('tension_arc', '')}
 TWIST TO LAND: {extracted.get('twist', '')}
 HOOK HINT: {hook_hint}
@@ -240,8 +252,6 @@ Return ONLY this JSON object (no markdown):
 
     # ------------------------------------------------------------------
     # PASS 3 — HOOK SHARPENER
-    # Rewrites ONLY the opening line to be maximally scroll-stopping.
-    # Does NOT touch the rest of the script.
     # ------------------------------------------------------------------
     def _pass3_sharpen_hook(self, script_data: dict) -> dict:
         logger.info("  [Pass 3/3] Sharpening hook...")
@@ -253,7 +263,6 @@ Return ONLY this JSON object (no markdown):
             logger.warning("  [Pass 3/3] No hook to sharpen. Skipping.")
             return script_data
 
-        # Extract the first sentence to sharpen
         sentences = original_script.split(". ")
         first_sentence = sentences[0] if sentences else original_hook
         rest_of_script = ". ".join(sentences[1:]) if len(sentences) > 1 else ""
@@ -276,22 +285,16 @@ Return ONLY the improved opening line. No quotes. No explanation."""
 
         try:
             sharpened_hook = self._call_llm(
-                prompt, HOOK_SHARPENER_SYSTEM,
-                max_tokens=80  # Keep it fast — we only need one sentence
+                prompt, HOOK_SHARPENER_SYSTEM, max_tokens=80
             ).strip().strip('"').strip("'")
 
             if sharpened_hook and len(sharpened_hook.split()) <= 25:
-                # Rebuild the script with the new hook
-                if rest_of_script:
-                    new_script = sharpened_hook + ". " + rest_of_script
-                else:
-                    new_script = sharpened_hook
-
+                new_script = sharpened_hook + ". " + rest_of_script if rest_of_script else sharpened_hook
                 script_data["script"] = new_script
                 script_data["hook"] = sharpened_hook
                 logger.success(f"  [Pass 3/3] Hook sharpened: \"{sharpened_hook}\"")
             else:
-                logger.warning(f"  [Pass 3/3] Sharpened hook was too long or empty. Keeping original.")
+                logger.warning("  [Pass 3/3] Sharpened hook was too long or empty. Keeping original.")
 
         except Exception as e:
             logger.warning(f"  [Pass 3/3] Hook sharpening failed: {e}. Keeping original hook.")
@@ -316,10 +319,18 @@ Return ONLY the improved opening line. No quotes. No explanation."""
             # PASS 3
             script_data = self._pass3_sharpen_hook(script_data)
 
+            # ── FIX: attach extracted data and KB preset so VideoWorkflow ──
+            # can forward them to VisualDirector and VideoComposer.
+            # Previously these were local vars that never reached the workflow.
+            emotion = script_data.get("emotion", "curiosity")
+            script_data["_extracted"] = extracted
+            script_data["_kb_preset"] = EMOTION_KB_PRESET.get(emotion, EMOTION_KB_PRESET["default"])
+
             logger.success(
                 f"ScriptWriterAgent complete | "
                 f"Title: '{script_data.get('title', 'Untitled')}' | "
-                f"Hook: '{script_data.get('hook', '')[:60]}...'"
+                f"Hook: '{script_data.get('hook', '')[:60]}...' | "
+                f"KB preset: {script_data['_kb_preset']}"
             )
             return script_data
 
@@ -335,20 +346,18 @@ Return ONLY the improved opening line. No quotes. No explanation."""
     # ------------------------------------------------------------------
     @staticmethod
     def _strip_json_fences(raw: str) -> str:
-        """Remove markdown code fences that LLMs sometimes wrap JSON in."""
         raw = raw.strip()
         if raw.startswith("```"):
             parts = raw.split("```")
-            # parts[1] is the content between the first pair of fences
             raw = parts[1]
             if raw.startswith("json"):
                 raw = raw[4:]
         return raw.strip()
 
     def _fallback_script(self, topic_brief: dict, video_id: str, target_words: int) -> dict:
-        """Emergency fallback if all three passes fail."""
         topic = topic_brief.get("topic", "this")
         hook = topic_brief.get("hook", f"Nobody told you this about {topic}...")
+        emotion = topic_brief.get("emotion", "curiosity")
         script = (
             f"{hook} "
             f"Most people go through life without understanding the real truth about {topic}. "
@@ -359,14 +368,23 @@ Return ONLY the improved opening line. No quotes. No explanation."""
             f"If this made you think, share it with someone who needs to hear it."
         )
         return {
-            "video_id": video_id,
-            "title": str(topic)[:55],
+            "video_id":   video_id,
+            "title":      str(topic)[:55],
             "description": f"{topic} #Shorts #Viral",
-            "tags": ["shorts", "viral", "facts", "motivation", "trending"],
-            "script": script,
-            "hook": hook,
-            "cta": "Share it with someone who needs to hear it.",
+            "tags":       ["shorts", "viral", "facts", "motivation", "trending"],
+            "script":     script,
+            "hook":       hook,
+            "cta":        "Share it with someone who needs to hear it.",
             "word_count": len(script.split()),
-            "emotion": topic_brief.get("emotion", "curiosity"),
+            "emotion":    emotion,
             "topic_brief": topic_brief,
+            # Attach these even on fallback so workflow never KeyErrors
+            "_extracted": {
+                "core_mystery":      topic,
+                "emotional_trigger": emotion,
+                "key_facts":         [hook, "", ""],
+                "tension_arc":       "Build curiosity, deliver surprise",
+                "twist":             hook,
+            },
+            "_kb_preset": EMOTION_KB_PRESET.get(emotion, EMOTION_KB_PRESET["default"]),
         }

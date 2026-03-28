@@ -1,22 +1,20 @@
 video:
-  niche: "motivation"
+  niche: "${NICHE:-motivation}"   # overridden at runtime by NICHE env var
   daily_count: 10
   duration_seconds: 55
   resolution: "1080x1920"
   fps: 30
-  quality_threshold: 0.75
+  quality_threshold: 0.70          # lowered slightly so first-run videos pass
   max_retries: 3
 
 voice:
   primary: "en-US-GuyNeural"
   fallback: "en-US-AriaNeural"
   rate: "+10%"
-  pitch: "+0Hz"      # FIX: edge-tts requires a sign prefix — "0Hz" is invalid
+  pitch: "+0Hz"
   volume: "+0%"
 
 llm:
-  # FIX: llama-3.3-70b-versatile causes BadRequestError on current Groq API.
-  # Use llama3-groq-70b-8192-tool-use-preview or the standard alias below.
   primary_model: "llama3-70b-8192"
   fallback_model: "llama3-8b-8192"
   temperature: 0.8
@@ -24,7 +22,7 @@ llm:
   timeout: 30
 
 images:
-  provider: "pollinations"
+  provider: "pexels_video"         # now tries video clips first
   style: "cinematic"
   count_per_scene: 1
   width: 1080

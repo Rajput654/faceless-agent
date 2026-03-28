@@ -1,27 +1,38 @@
-# --- CORE AI FRAMEWORKS ---
-crewai>=0.86.0
-langgraph>=0.2.50
-langchain>=0.3.10
-langchain-groq>=0.2.3
-langchain-community>=0.3.10
-groq>=0.13.0
-google-generativeai>=0.8.3
+# ============================================================
+# PINNED VERSIONS — prevents pip resolution-too-deep errors
+# caused by crewai/langchain/langgraph fighting each other
+# across hundreds of versions during backtracking.
+# ============================================================
+
+# --- CORE AI FRAMEWORKS (pinned to known-compatible set) ---
+crewai==1.6.1
+langgraph==1.0.5
+langgraph-checkpoint==2.1.2
+langgraph-prebuilt==1.0.8
+langgraph-sdk==0.2.12
+langchain==1.2.3
+langchain-core==1.2.23
+langchain-groq==0.2.3
+langchain-community==0.3.10
+langchain-classic==1.0.2
+langchain-text-splitters==1.1.1
+groq==0.37.0
+google-generativeai==0.8.5
 
 # --- TTS BACKENDS ---
-# FIX: pin to 0.1.7 — older versions pull pkuseg==0.0.25 which has no Python 3.11
-# pre-built wheel and fails to compile (ModuleNotFoundError: No module named 'numpy')
+# pinned to 0.1.7 — older versions pull pkuseg==0.0.25 (no Py3.11 wheel)
 chatterbox-tts==0.1.7
-torch>=2.0.0,<3.0.0
-torchaudio>=2.0.0,<3.0.0
+torch==2.6.0
+torchaudio==2.6.0
 
-# FIX: explicit numpy pin — pkuseg and librosa both need numpy present at build time
+# FIX: explicit numpy pin — must be installed before any source packages
 numpy>=1.26.0,<3.0.0
 
-# FIX: pin pandas — prevents pip backtracking to pandas 1.4.4 (source-only, no Py3.11 wheel)
+# FIX: pin pandas — prevents backtrack to 1.4.4 (source-only, no Py3.11 wheel)
 pandas>=2.2.2,<3.0.0
 
 # Kokoro: fast, Apache 2.0, good fallback
-kokoro-onnx>=0.4.0
+kokoro-onnx==0.4.9
 soundfile>=0.12.1
 
 # edge-tts: Microsoft Neural voices

@@ -8,17 +8,16 @@ groq>=0.13.0
 google-generativeai>=0.8.3
 
 # --- TTS BACKENDS ---
-# Chatterbox: near-human quality, MIT license, beats ElevenLabs in blind tests
-# emotion control via exps parameter (0.0-2.0), zero-shot voice cloning
-chatterbox-tts>=0.1.0
+# FIX: pin to 0.1.7 — older versions pull pkuseg==0.0.25 which has no Python 3.11
+# pre-built wheel and fails to compile (ModuleNotFoundError: No module named 'numpy')
+chatterbox-tts==0.1.7
+torch>=2.0.0,<3.0.0
+torchaudio>=2.0.0,<3.0.0
 
-# FIX: pin torch to CPU-only wheel — avoids 2GB+ CUDA download on GitHub Actions
-# and prevents pandas version backtracking caused by gradio's loose pandas>=1.0 bound
-torch>=2.0.0,<3.0.0 --index-url https://download.pytorch.org/whl/cpu
-torchaudio>=2.0.0,<3.0.0 --index-url https://download.pytorch.org/whl/cpu
+# FIX: explicit numpy pin — pkuseg and librosa both need numpy present at build time
+numpy>=1.26.0,<3.0.0
 
-# FIX: pin pandas to a modern pre-built wheel — prevents pip from backtracking
-# to pandas 1.4.4 (source-only, fails to build on Python 3.11 without pkg_resources)
+# FIX: pin pandas — prevents pip backtracking to pandas 1.4.4 (source-only, no Py3.11 wheel)
 pandas>=2.2.2,<3.0.0
 
 # Kokoro: fast, Apache 2.0, good fallback

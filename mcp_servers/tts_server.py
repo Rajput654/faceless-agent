@@ -1,22 +1,37 @@
 """
 mcp_servers/tts_server.py
 
-TTS backend priority:
-  1. Kokoro ONNX  — near-human, Apache 2.0, auto-downloads with integrity check
-  2. edge-tts     — Microsoft Neural voices, genuinely human-sounding
-  3. gTTS         — robotic last resort
+UPGRADED TTS Backend Priority:
+  1. Chatterbox TTS  — near-human, MIT license, beats ElevenLabs in blind tests
+                       emotion control via exps parameter (0.0-2.0)
+                       zero-shot voice cloning from 5s reference clip
+  2. Kokoro ONNX     — fast, Apache 2.0, good quality fallback
+  3. edge-tts        — Microsoft Neural voices, human-sounding
+  4. gTTS            — robotic last resort only
 
-Fix: Kokoro model download now validates the file is a real ONNX protobuf
-before accepting it.  A partial/corrupt download is deleted and retried.
+Chatterbox emotion mapping:
+  horror/fear    → exps=1.5  (high expressiveness, dramatic)
+  motivation     → exps=1.2  (uplifting, energetic)
+  reddit_story   → exps=0.8  (conversational, natural)
+  brainrot       → exps=1.8  (chaotic, expressive)
+  finance        → exps=0.6  (calm, authoritative)
 """
 import os
 import re
 import asyncio
-import struct
 import subprocess
 import urllib.request
 from pathlib import Path
 from loguru import logger
+
+# ── Chatterbox ────────────────────────────────────────────────────────────────
+try:
+    import torch
+    import torchaudio
+    from chatterbox.tts import ChatterboxTTS
+    CHATTERBOX_AVAILABLE = True
+except ImportError:
+    CHATTERBOX_AVAILABLE = False
 
 # ── Kokoro ────────────────────────────────────────────────────────────────────
 try:
@@ -49,70 +64,48 @@ KOKORO_MODEL_URL   = "https://github.com/thewh1teagle/kokoro-onnx/releases/downl
 KOKORO_VOICES_URL  = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files/voices.bin"
 KOKORO_MODEL_PATH  = os.environ.get("KOKORO_MODEL_PATH",  "kokoro-v1.0.onnx")
 KOKORO_VOICES_PATH = os.environ.get("KOKORO_VOICES_PATH", "voices.bin")
-
-# Minimum expected file sizes (bytes) — rejects obvious partial downloads
-KOKORO_MODEL_MIN_BYTES  = 80_000_000   # model is ~300 MB; reject anything < 80 MB
-KOKORO_VOICES_MIN_BYTES = 1_000_000    # voices.bin is ~4 MB; reject anything < 1 MB
+KOKORO_MODEL_MIN_BYTES  = 80_000_000
+KOKORO_VOICES_MIN_BYTES = 1_000_000
 
 
 def _is_valid_onnx(path: str) -> bool:
-    """
-    Quick sanity-check: real ONNX files start with a protobuf field header.
-    This catches partial/corrupt downloads without loading the full model.
-    """
     try:
         size = os.path.getsize(path)
         if size < KOKORO_MODEL_MIN_BYTES:
-            logger.warning(f"ONNX file too small: {size} bytes (expected ≥ {KOKORO_MODEL_MIN_BYTES})")
             return False
-        # Protobuf field 1 (ir_version), wire type 0 → byte 0x08
         with open(path, "rb") as f:
             first_byte = f.read(1)
-        if first_byte not in (b'\x08', b'\n'):   # 0x08 or 0x0a are valid ONNX starts
-            logger.warning(f"ONNX file has unexpected first byte: {first_byte!r}")
-            return False
-        return True
-    except Exception as e:
-        logger.warning(f"ONNX validation error: {e}")
+        return first_byte in (b'\x08', b'\n')
+    except Exception:
         return False
 
 
 def _download_kokoro_models() -> bool:
-    """Download Kokoro model files, validating each after download."""
     downloads = [
         (KOKORO_MODEL_URL,  KOKORO_MODEL_PATH,  KOKORO_MODEL_MIN_BYTES,  "model"),
         (KOKORO_VOICES_URL, KOKORO_VOICES_PATH, KOKORO_VOICES_MIN_BYTES, "voices"),
     ]
     for url, path, min_bytes, label in downloads:
-        # Delete corrupt/partial existing file
         if os.path.exists(path):
             size = os.path.getsize(path)
-            if size < min_bytes:
-                logger.warning(f"Existing {label} file is too small ({size} bytes) — re-downloading")
-                os.remove(path)
-            elif label == "model" and not _is_valid_onnx(path):
-                logger.warning(f"Existing {label} file is corrupt — re-downloading")
-                os.remove(path)
-            else:
+            if size >= min_bytes and (label != "model" or _is_valid_onnx(path)):
                 logger.info(f"Kokoro {label} already valid: {path}")
                 continue
+            os.remove(path)
 
-        logger.info(f"Downloading Kokoro {label}: {path} …")
+        logger.info(f"Downloading Kokoro {label}...")
         tmp = path + ".tmp"
         try:
             urllib.request.urlretrieve(url, tmp)
-            # Validate before accepting
             actual_size = os.path.getsize(tmp)
             if actual_size < min_bytes:
                 os.remove(tmp)
-                logger.error(f"Downloaded {label} is too small ({actual_size} bytes) — download may have failed")
                 return False
             if label == "model" and not _is_valid_onnx(tmp):
                 os.remove(tmp)
-                logger.error(f"Downloaded {label} failed ONNX validation — file is corrupt")
                 return False
             os.rename(tmp, path)
-            logger.success(f"Kokoro {label} downloaded: {path} ({actual_size/1e6:.0f} MB)")
+            logger.success(f"Kokoro {label} downloaded ({actual_size/1e6:.0f} MB)")
         except Exception as e:
             if os.path.exists(tmp):
                 os.remove(tmp)
@@ -122,8 +115,19 @@ def _download_kokoro_models() -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Voice maps
+# Niche → voice/emotion config maps
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Chatterbox: exps controls expressiveness (0.0=monotone, 2.0=very dramatic)
+# cfg_weight: how closely to follow voice clone (if used), 0.5 is balanced
+CHATTERBOX_NICHE_CONFIG = {
+    "motivation":   {"exps": 1.2, "cfg_weight": 0.5},
+    "horror":       {"exps": 1.5, "cfg_weight": 0.5},
+    "reddit_story": {"exps": 0.9, "cfg_weight": 0.5},
+    "brainrot":     {"exps": 1.8, "cfg_weight": 0.5},
+    "finance":      {"exps": 0.6, "cfg_weight": 0.5},
+    "default":      {"exps": 1.0, "cfg_weight": 0.5},
+}
 
 KOKORO_VOICE_MAP = {
     "motivation":   ("am_michael", 1.1),
@@ -142,17 +146,17 @@ KOKORO_VOICES = [
 ]
 
 EDGE_VOICE_MAP = {
-    "motivation":   ("en-US-GuyNeural",    "+15%"),
-    "horror":       ("en-US-DavisNeural",  "-5%"),
-    "reddit_story": ("en-US-AriaNeural",   "+5%"),
-    "brainrot":     ("en-US-JennyNeural",  "+25%"),
-    "finance":      ("en-GB-RyanNeural",   "+10%"),
-    "default":      ("en-US-GuyNeural",    "+10%"),
+    "motivation":   ("en-US-GuyNeural",   "+15%"),
+    "horror":       ("en-US-DavisNeural", "-5%"),
+    "reddit_story": ("en-US-AriaNeural",  "+5%"),
+    "brainrot":     ("en-US-JennyNeural", "+25%"),
+    "finance":      ("en-GB-RyanNeural",  "+10%"),
+    "default":      ("en-US-GuyNeural",   "+10%"),
 }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SRT helpers
+# SRT / subtitle helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _ms_to_srt(ms: int) -> str:
@@ -163,7 +167,8 @@ def _ms_to_srt(ms: int) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{msec:03d}"
 
 
-def _build_srt(text: str, total_ms: int, words_per_line: int = 5) -> str:
+def _build_srt(text: str, total_ms: int, words_per_line: int = 4) -> str:
+    """Build a simple SRT where each block = words_per_line words."""
     words  = text.split()
     chunks = [words[i:i + words_per_line] for i in range(0, len(words), words_per_line)]
     n      = max(len(chunks), 1)
@@ -189,13 +194,13 @@ def _audio_duration_ms(path: str) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# edge-tts async helpers
+# edge-tts async helpers (unchanged from original)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _wbs_to_srt(wbs: list) -> str:
     if not wbs:
         return ""
-    chunks = [wbs[i:i + 5] for i in range(0, len(wbs), 5)]
+    chunks = [wbs[i:i + 4] for i in range(0, len(wbs), 4)]
     out = []
     for i, c in enumerate(chunks, 1):
         def fmt(ns):
@@ -248,10 +253,8 @@ async def _edge_async(text, out_path, sub_path, voice, rate, pitch, volume):
                     "duration": chunk.get("duration", 0),
                     "text":     chunk.get("text", ""),
                 })
-    # Build SRT from word boundaries
     srt = _wbs_to_srt(wbs)
     if not srt:
-        # fallback: try SubMaker
         try:
             sub = edge_tts.SubMaker()
             for wb in wbs:
@@ -271,7 +274,6 @@ async def _edge_async(text, out_path, sub_path, voice, rate, pitch, volume):
                         continue
         except Exception:
             pass
-    # Fallback SRT if still empty
     if not srt:
         duration_ms = _audio_duration_ms(out_path)
         srt = _build_srt(text, duration_ms)
@@ -280,7 +282,7 @@ async def _edge_async(text, out_path, sub_path, voice, rate, pitch, volume):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Server
+# Main TTS Server
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TTSMCPServer:
@@ -294,16 +296,29 @@ class TTSMCPServer:
             "generate_speech": self._generate_speech,
             "list_voices":     self._list_voices,
         }
-        self._kokoro_model = None
+        self._kokoro_model    = None
+        self._chatterbox_model = None
+
+    # ── Model loaders ─────────────────────────────────────────────────────────
+
+    def _load_chatterbox(self):
+        if self._chatterbox_model is None:
+            logger.info("Loading Chatterbox TTS model...")
+            device = "cuda" if (CHATTERBOX_AVAILABLE and torch.cuda.is_available()) else "cpu"
+            self._chatterbox_model = ChatterboxTTS.from_pretrained(device=device)
+            logger.success(f"Chatterbox loaded on {device}")
+        return self._chatterbox_model
 
     def _load_kokoro(self):
         if self._kokoro_model is None:
             ok = _download_kokoro_models()
             if not ok:
                 raise RuntimeError("Kokoro model download/validation failed")
-            logger.info("Loading Kokoro TTS model…")
+            logger.info("Loading Kokoro TTS model...")
             self._kokoro_model = Kokoro(KOKORO_MODEL_PATH, KOKORO_VOICES_PATH)
         return self._kokoro_model
+
+    # ── Public API ────────────────────────────────────────────────────────────
 
     def call(self, tool_name: str, **kwargs):
         if tool_name not in self.tools:
@@ -321,14 +336,21 @@ class TTSMCPServer:
 
         niche = os.environ.get("NICHE", "default")
 
-        # 1️⃣ Kokoro
+        # 1️⃣  Chatterbox (primary — near-human quality)
+        if CHATTERBOX_AVAILABLE:
+            r = self._chatterbox_generate(text, output_path, subtitle_path, niche)
+            if r.get("success"):
+                return r
+            logger.warning(f"Chatterbox failed: {r.get('error')} — trying Kokoro")
+
+        # 2️⃣  Kokoro ONNX
         if KOKORO_AVAILABLE:
             r = self._kokoro_generate(text, output_path, subtitle_path, voice, niche)
             if r.get("success"):
                 return r
             logger.warning(f"Kokoro failed: {r.get('error')} — trying edge-tts")
 
-        # 2️⃣ edge-tts (Microsoft Neural — human-sounding)
+        # 3️⃣  edge-tts
         if EDGE_TTS_AVAILABLE:
             edge_voice, edge_rate = EDGE_VOICE_MAP.get(niche, EDGE_VOICE_MAP["default"])
             r = self._edge_generate(text, output_path, subtitle_path,
@@ -337,13 +359,75 @@ class TTSMCPServer:
                 return r
             logger.warning(f"edge-tts failed: {r.get('error')} — trying gTTS")
 
-        # 3️⃣ gTTS (last resort)
+        # 4️⃣  gTTS (last resort)
         if GTTS_AVAILABLE:
             r = self._gtts_generate(text, output_path, subtitle_path)
             if r.get("success"):
                 return r
 
         return {"success": False, "error": "All TTS backends failed"}
+
+    # ── Chatterbox ────────────────────────────────────────────────────────────
+
+    def _chatterbox_generate(self, text, output_path, subtitle_path, niche):
+        try:
+            cfg = CHATTERBOX_NICHE_CONFIG.get(niche, CHATTERBOX_NICHE_CONFIG["default"])
+            exps       = cfg["exps"]
+            cfg_weight = cfg["cfg_weight"]
+
+            model = self._load_chatterbox()
+
+            # Optional: voice clone reference audio
+            # Place a file at assets/voices/{niche}_reference.wav for cloning
+            audio_prompt_path = f"assets/voices/{niche}_reference.wav"
+            audio_prompt = audio_prompt_path if os.path.exists(audio_prompt_path) else None
+
+            if audio_prompt:
+                wav = model.generate(
+                    text,
+                    audio_prompt_path=audio_prompt,
+                    exps=exps,
+                    cfg_weight=cfg_weight,
+                )
+                logger.info(f"Chatterbox: using voice clone from {audio_prompt}")
+            else:
+                wav = model.generate(text, exps=exps)
+
+            # Save as WAV first, then convert to MP3
+            wav_path = output_path.replace(".mp3", "_cb_tmp.wav")
+            torchaudio.save(wav_path, wav, model.sr)
+
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", wav_path,
+                 "-codec:a", "libmp3lame", "-qscale:a", "2", output_path],
+                capture_output=True, timeout=120,
+            )
+            if os.path.exists(wav_path):
+                os.remove(wav_path)
+
+            size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+            if size == 0:
+                return {"success": False, "error": "Chatterbox produced empty audio"}
+
+            duration_ms = _audio_duration_ms(output_path)
+            with open(subtitle_path, "w", encoding="utf-8") as f:
+                f.write(_build_srt(text, duration_ms))
+
+            logger.success(
+                f"Chatterbox ✅  niche={niche} exps={exps} | "
+                f"{size/1024:.0f} KB | {duration_ms/1000:.1f}s"
+            )
+            return {
+                "success":          True,
+                "audio_path":       output_path,
+                "subtitle_path":    subtitle_path,
+                "audio_size_bytes": size,
+                "voice_used":       f"chatterbox-{niche}",
+                "backend":          "chatterbox",
+                "duration_ms":      duration_ms,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
     # ── Kokoro ────────────────────────────────────────────────────────────────
 
@@ -376,9 +460,13 @@ class TTSMCPServer:
 
             logger.success(f"Kokoro ✅  {kokoro_voice} speed={speed} | {size} bytes")
             return {
-                "success": True, "audio_path": output_path,
-                "subtitle_path": subtitle_path, "audio_size_bytes": size,
-                "voice_used": kokoro_voice, "backend": "kokoro",
+                "success":          True,
+                "audio_path":       output_path,
+                "subtitle_path":    subtitle_path,
+                "audio_size_bytes": size,
+                "voice_used":       kokoro_voice,
+                "backend":          "kokoro",
+                "duration_ms":      duration_ms,
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -401,17 +489,21 @@ class TTSMCPServer:
             if size == 0:
                 return {"success": False, "error": "edge-tts produced empty audio"}
 
-            # Ensure subtitle file exists even if edge-tts wrote nothing
             if not os.path.exists(subtitle_path) or os.path.getsize(subtitle_path) == 0:
                 duration_ms = _audio_duration_ms(output_path)
                 with open(subtitle_path, "w", encoding="utf-8") as f:
                     f.write(_build_srt(text, duration_ms))
 
-            logger.success(f"edge-tts ✅  {voice} | {output_path} ({size} bytes)")
+            duration_ms = _audio_duration_ms(output_path)
+            logger.success(f"edge-tts ✅  {voice} | {size} bytes")
             return {
-                "success": True, "audio_path": output_path,
-                "subtitle_path": subtitle_path, "audio_size_bytes": size,
-                "voice_used": voice, "backend": "edge-tts",
+                "success":          True,
+                "audio_path":       output_path,
+                "subtitle_path":    subtitle_path,
+                "audio_size_bytes": size,
+                "voice_used":       voice,
+                "backend":          "edge-tts",
+                "duration_ms":      duration_ms,
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -429,9 +521,13 @@ class TTSMCPServer:
                 f.write(_build_srt(text, duration_ms))
             logger.warning(f"gTTS ⚠️  (robotic fallback) {output_path}")
             return {
-                "success": True, "audio_path": output_path,
-                "subtitle_path": subtitle_path, "audio_size_bytes": size,
-                "voice_used": "gtts-en", "backend": "gtts",
+                "success":          True,
+                "audio_path":       output_path,
+                "subtitle_path":    subtitle_path,
+                "audio_size_bytes": size,
+                "voice_used":       "gtts-en",
+                "backend":          "gtts",
+                "duration_ms":      duration_ms,
             }
         except Exception as e:
             return {"success": False, "error": str(e)}

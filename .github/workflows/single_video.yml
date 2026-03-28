@@ -44,6 +44,15 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg
 
+      # FIX: pre-install numpy and setuptools BEFORE requirements.txt
+      # pkuseg (pulled by chatterbox-tts<0.1.7) needs numpy at build time.
+      # pinning chatterbox-tts==0.1.7 in requirements.txt avoids pkuseg entirely,
+      # but this step is kept as a safety net for any other legacy source packages.
+      - name: Pre-install build dependencies
+        run: |
+          pip install --upgrade pip setuptools wheel
+          pip install "numpy>=1.26.0,<3.0.0"
+
       - name: Install Python dependencies
         run: pip install -r requirements.txt && playwright install chromium --with-deps
 

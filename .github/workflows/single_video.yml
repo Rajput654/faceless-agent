@@ -44,19 +44,19 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg
 
-      # FIX: pre-install numpy and setuptools BEFORE requirements.txt
-      # pkuseg (pulled by chatterbox-tts<0.1.7) needs numpy at build time.
-      # pinning chatterbox-tts==0.1.7 in requirements.txt avoids pkuseg entirely,
-      # but this step is kept as a safety net for any other legacy source packages.
       - name: Pre-install build dependencies
         run: |
           pip install --upgrade pip setuptools wheel
           pip install "numpy>=1.26.0,<3.0.0"
 
       - name: Install Python dependencies
-        run: pip install -r requirements.txt && playwright install chromium --with-deps
+        run: |
+          pip install \
+            --use-pep517 \
+            --resolver=backtracking \
+            -r requirements.txt
+          playwright install chromium --with-deps
 
-      # ── Kokoro TTS model (cached) ──────────────────────────────────────────
       - name: Cache Kokoro model files
         id: cache-kokoro
         uses: actions/cache@v4
@@ -75,7 +75,6 @@ jobs:
             "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files/voices.bin"
           ls -lh kokoro-v1.0.onnx voices.bin
 
-      # ── Research / use custom topic ────────────────────────────────────────
       - name: Research or use custom topic
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
@@ -102,7 +101,6 @@ jobs:
             python main.py --mode research --niche "$NICHE" --topics-file topics.json
           fi
 
-      # ── Generate video ─────────────────────────────────────────────────────
       - name: Generate video
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}

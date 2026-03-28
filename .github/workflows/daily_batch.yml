@@ -40,21 +40,13 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
 
-      # FIX 1: upgrade pip and pre-install build deps BEFORE requirements.txt
-      # numpy must exist before any source package tries to use it at build time.
       - name: Pre-install build dependencies
         run: |
           pip install --upgrade pip setuptools wheel
           pip install "numpy>=1.26.0,<3.0.0"
 
-      # FIX 2: install requirements with pip's new resolver and a higher backtrack limit
-      # --use-pep517 forces wheel builds, avoiding legacy setup.py issues
       - name: Install dependencies
-        run: |
-          pip install \
-            --use-pep517 \
-            --resolver=backtracking \
-            -r requirements.txt
+        run: pip install -r requirements.txt
 
       - name: Install Playwright
         run: playwright install chromium --with-deps
@@ -133,11 +125,7 @@ jobs:
           pip install "numpy>=1.26.0,<3.0.0"
 
       - name: Install Python dependencies
-        run: |
-          pip install \
-            --use-pep517 \
-            --resolver=backtracking \
-            -r requirements.txt
+        run: pip install -r requirements.txt
 
       - uses: actions/download-artifact@v4
         with:
@@ -157,7 +145,6 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
         run: |
-          echo "=== Topics ==="
           python -c "
           import json, sys
           t = json.load(open('topics.json'))
@@ -183,7 +170,6 @@ jobs:
           NICHE: ${{ env.NICHE }}
         run: |
           VIDEO_ID="video_$(printf '%03d' ${{ matrix.video_index }})"
-          echo "Starting generation for: $VIDEO_ID (niche: $NICHE)"
           set -o pipefail
           python -u main.py \
             --mode single \
@@ -240,11 +226,7 @@ jobs:
           pip install "numpy>=1.26.0,<3.0.0"
 
       - name: Install dependencies
-        run: |
-          pip install \
-            --use-pep517 \
-            --resolver=backtracking \
-            -r requirements.txt
+        run: pip install -r requirements.txt
 
       - uses: actions/download-artifact@v4
         with:

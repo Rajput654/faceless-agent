@@ -45,6 +45,8 @@ jobs:
           sudo apt-get install -y ffmpeg
 
       - name: Install Python dependencies
+        # FIX: added --upgrade pip first; requirements.txt now uses compatible
+        # langgraph version so langgraph-checkpoint resolves correctly.
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
@@ -112,7 +114,11 @@ jobs:
         run: find /tmp -name "*.mp4" -exec ls -lh {} \; 2>/dev/null || echo "No MP4 files"
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: generated-short-${{ github.event.inputs.niche }}
+          # FIX: use if-no-files-found: warn so the step doesn't fail the whole
+          # workflow when a video fails to generate (makes failures easier to debug)
           path: /tmp/manual_001_final.mp4
+          if-no-files-found: warn
           retention-days: 7

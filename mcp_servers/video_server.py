@@ -1,12 +1,15 @@
 """
 mcp_servers/video_server.py
 
-FFmpeg-based video composition with:
-  • Ken Burns effect  — slow zoom-in or pan on every image (no static frames)
-  • Crossfade transitions between images
-  • Bold ASS/SRT captions burned in
-  • Voice + music mixing with ducking
-  • 1080×1920 portrait output (YouTube Shorts / TikTok / Reels)
+FFmpeg-based video composition that handles TWO source types:
+  • Real MP4 stock clips (from Pexels / Pixabay) — trimmed, scaled, concatenated
+  • Still images (fallback)                       — Ken Burns zoom/pan
+
+Produces a polished 1080×1920 portrait short with:
+  • Voice-over + background music with ducking
+  • Bold ASS/SRT captions burned in (word-level pop style)
+  • Smooth crossfade transitions
+  • Proper colour space and fast-start for upload
 """
 import os
 import random
@@ -16,21 +19,14 @@ from loguru import logger
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Ken Burns presets  (zoompan filter strings, filled in at runtime)
-# Each entry is (zoom_expr, x_expr, y_expr) for ffmpeg zoompan
+# Ken Burns presets (used only for still-image fallback)
 # ─────────────────────────────────────────────────────────────────────────────
 KB_PRESETS = [
-    # Slow zoom in from centre
     ("min(zoom+0.0008,1.3)", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"),
-    # Slow zoom out (start zoomed, pull back)
     ("if(eq(on,1),1.3,max(zoom-0.0008,1.0))", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"),
-    # Pan left to right
     ("1.12", "if(eq(on,1),0,x+0.6)", "ih/2-(ih/zoom/2)"),
-    # Pan right to left
     ("1.12", "if(eq(on,1),iw-iw/zoom,max(0,x-0.6))", "ih/2-(ih/zoom/2)"),
-    # Zoom in top-left
     ("min(zoom+0.0008,1.3)", "0", "0"),
-    # Zoom in bottom-right
     ("min(zoom+0.0008,1.3)", "iw-(iw/zoom)", "ih-(ih/zoom)"),
 ]
 
@@ -61,79 +57,43 @@ class VideoMCPServer:
         image_paths:   list,
         audio_path:    str,
         output_path:   str,
-        subtitle_path: str  = None,
-        music_path:    str  = None,
+        subtitle_path: str   = None,
+        music_path:    str   = None,
         music_volume:  float = 0.10,
-        fps:           int  = 30,
-        width:         int  = 1080,
-        height:        int  = 1920,
+        fps:           int   = 30,
+        width:         int   = 1080,
+        height:        int   = 1920,
         **kwargs,
     ):
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
         if not image_paths:
-            return {"success": False, "error": "No images provided"}
+            return {"success": False, "error": "No visual assets provided"}
         if not audio_path or not os.path.exists(audio_path):
             return {"success": False, "error": f"Audio not found: {audio_path}"}
 
-        valid_imgs = [p for p in image_paths if os.path.exists(p)]
-        if not valid_imgs:
-            return {"success": False, "error": "No valid image files"}
+        valid_assets = [p for p in image_paths if p and os.path.exists(p)]
+        if not valid_assets:
+            return {"success": False, "error": "No valid visual files found"}
 
         try:
-            duration     = self._audio_duration(audio_path)
+            duration = self._audio_duration(audio_path)
             if duration <= 0:
                 duration = 55.0
 
-            xfade_dur    = 0.5                          # seconds of crossfade
-            n            = len(valid_imgs)
-            seg_dur      = duration / n                 # each image's screen time
-            # Each segment must be long enough to overlap on both sides
-            seg_dur      = max(seg_dur, xfade_dur * 2 + 0.5)
-            total_raw    = seg_dur * n                  # total before crossfade trimming
+            # Detect whether assets are video clips or still images
+            is_video = any(p.lower().endswith(".mp4") for p in valid_assets)
 
-            # ── Step 1: Ken Burns per-image clips ─────────────────────────────
-            kb_clips = []
-            preset_order = random.sample(range(len(KB_PRESETS)), min(n, len(KB_PRESETS)))
-            while len(preset_order) < n:
-                preset_order += random.sample(range(len(KB_PRESETS)), min(n, len(KB_PRESETS)))
-            preset_order = preset_order[:n]
-
-            for i, img in enumerate(valid_imgs):
-                clip_path = output_path.replace(".mp4", f"_kb_{i:02d}.mp4")
-                zoom_e, x_e, y_e = KB_PRESETS[preset_order[i]]
-                frames = int(seg_dur * fps)
-
-                # zoompan produces frames at 25fps by default; we force our fps
-                # scale → zoompan → scale to exact resolution
-                vf = (
-                    f"scale={width*2}:{height*2}:force_original_aspect_ratio=increase,"
-                    f"crop={width*2}:{height*2},"
-                    f"zoompan=z='{zoom_e}':x='{x_e}':y='{y_e}'"
-                    f":d={frames}:s={width}x{height}:fps={fps},"
-                    f"setsar=1"
+            if is_video:
+                merged = self._compose_from_clips(
+                    valid_assets, output_path, duration, fps, width, height
                 )
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-loop", "1", "-i", img,
-                    "-vf", vf,
-                    "-t", str(seg_dur),
-                    "-c:v", "libx264", "-preset", "fast", "-crf", "22",
-                    "-pix_fmt", "yuv420p",
-                    clip_path,
-                ]
-                self._run(cmd, f"Ken Burns clip {i}")
-                kb_clips.append(clip_path)
-
-            # ── Step 2: crossfade clips together ──────────────────────────────
-            if n == 1:
-                merged = kb_clips[0]
             else:
-                merged = self._crossfade_clips(
-                    kb_clips, output_path, fps, xfade_dur, seg_dur, duration, width, height
+                merged = self._compose_from_images(
+                    valid_assets, output_path, duration, fps, width, height
                 )
 
-            # ── Step 3: mix audio (voice + optional music) ────────────────────
+            # ── Mix audio (voice + optional music) ────────────────────────────
             if music_path and os.path.exists(music_path):
                 mixed_audio = output_path.replace(".mp4", "_audio_mix.mp3")
                 self._run([
@@ -141,8 +101,11 @@ class VideoMCPServer:
                     "-i", audio_path,
                     "-i", music_path,
                     "-filter_complex",
-                    f"[0:a]volume=1.0[v];[1:a]volume={music_volume}[m];"
-                    f"[v][m]amix=inputs=2:duration=first:dropout_transition=2[out]",
+                    (
+                        f"[0:a]volume=1.0[v];"
+                        f"[1:a]volume={music_volume}[m];"
+                        f"[v][m]amix=inputs=2:duration=first:dropout_transition=2[out]"
+                    ),
                     "-map", "[out]",
                     "-t", str(duration),
                     "-c:a", "aac", "-b:a", "192k",
@@ -152,24 +115,8 @@ class VideoMCPServer:
             else:
                 final_audio = audio_path
 
-            # ── Step 4: combine video + audio + captions ──────────────────────
-            if subtitle_path and os.path.exists(subtitle_path):
-                ext = Path(subtitle_path).suffix.lower()
-                if ext == ".ass":
-                    sub_filter = f"ass='{subtitle_path}'"
-                else:
-                    # Bold white text, black outline, bottom-centre
-                    sub_filter = (
-                        f"subtitles='{subtitle_path}':"
-                        f"force_style='FontName=Arial,FontSize=68,Bold=1,"
-                        f"PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
-                        f"Outline=4,Shadow=2,Alignment=2,"
-                        f"MarginV=120'"
-                    )
-                vf_final = sub_filter
-            else:
-                vf_final = None
-
+            # ── Burn captions + combine with audio ───────────────────────────
+            vf_final = self._caption_filter(subtitle_path)
             compose_cmd = [
                 "ffmpeg", "-y",
                 "-i", merged,
@@ -184,17 +131,13 @@ class VideoMCPServer:
             compose_cmd.append(output_path)
             self._run(compose_cmd, "final compose")
 
-            # ── Cleanup temp files ────────────────────────────────────────────
-            for p in kb_clips:
-                if os.path.exists(p):
-                    os.remove(p)
-            for suffix in ["_audio_mix.mp3"]:
+            # ── Cleanup ───────────────────────────────────────────────────────
+            for suffix in ["_merged.mp4", "_audio_mix.mp3"]:
                 tmp = output_path.replace(".mp4", suffix)
                 if os.path.exists(tmp):
                     os.remove(tmp)
-            # Remove intermediate crossfade files
-            for i in range(n):
-                for tag in [f"_cf_{i:02d}.mp4"]:
+            for i in range(len(valid_assets)):
+                for tag in [f"_kb_{i:02d}.mp4", f"_scaled_{i:02d}.mp4", f"_cf_{i:02d}.mp4"]:
                     tmp = output_path.replace(".mp4", tag)
                     if os.path.exists(tmp):
                         os.remove(tmp)
@@ -205,7 +148,8 @@ class VideoMCPServer:
 
             logger.success(
                 f"Video composed ✅  {output_path} "
-                f"({file_size/1024/1024:.1f} MB, {duration:.1f}s, {n} scenes)"
+                f"({file_size/1024/1024:.1f} MB, {duration:.1f}s, "
+                f"{len(valid_assets)} {'clips' if is_video else 'images'})"
             )
             return {
                 "success":          True,
@@ -218,35 +162,113 @@ class VideoMCPServer:
             logger.error(f"Video composition failed: {e}")
             return {"success": False, "error": str(e)}
 
-    # ── Ken Burns crossfade chain ─────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # Real video clip pipeline
+    # ─────────────────────────────────────────────────────────────────────────
 
-    def _crossfade_clips(
-        self, clips, output_path, fps, xfade_dur, seg_dur, total_audio_dur, width, height
-    ):
+    def _compose_from_clips(self, clips, output_path, duration, fps, width, height):
         """
-        Chain N clips with xfade transitions using a single filtergraph.
-        Falls back to simple concat if anything goes wrong.
+        Scale/crop each clip to 1080×1920 portrait, trim to equal segments,
+        then concatenate with xfade transitions.
         """
+        n         = len(clips)
+        seg_dur   = duration / n
+        seg_dur   = max(seg_dur, 2.0)   # each clip at least 2 s on screen
+        xfade_dur = 0.4
+
+        scaled_clips = []
+        for i, clip in enumerate(clips):
+            out = output_path.replace(".mp4", f"_scaled_{i:02d}.mp4")
+            # Scale to fill portrait frame, then crop to exact size
+            vf = (
+                f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+                f"crop={width}:{height},"
+                f"setsar=1,fps={fps}"
+            )
+            self._run([
+                "ffmpeg", "-y",
+                "-i", clip,
+                "-t", str(seg_dur),
+                "-vf", vf,
+                "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+                "-pix_fmt", "yuv420p",
+                "-an",   # strip audio from stock clip — we use our own voice
+                out,
+            ], f"scale clip {i}")
+            scaled_clips.append(out)
+
+        if n == 1:
+            return scaled_clips[0]
+
+        return self._crossfade_clips(
+            scaled_clips, output_path, fps, xfade_dur, seg_dur, duration, width, height
+        )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Still image pipeline (Ken Burns fallback)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _compose_from_images(self, images, output_path, duration, fps, width, height):
+        n         = len(images)
+        seg_dur   = duration / n
+        seg_dur   = max(seg_dur, 2.5)
+        xfade_dur = 0.5
+
+        preset_order = random.sample(range(len(KB_PRESETS)), min(n, len(KB_PRESETS)))
+        while len(preset_order) < n:
+            preset_order += random.sample(range(len(KB_PRESETS)), min(n, len(KB_PRESETS)))
+        preset_order = preset_order[:n]
+
+        kb_clips = []
+        for i, img in enumerate(images):
+            clip_path = output_path.replace(".mp4", f"_kb_{i:02d}.mp4")
+            zoom_e, x_e, y_e = KB_PRESETS[preset_order[i]]
+            frames = int(seg_dur * fps)
+            vf = (
+                f"scale={width*2}:{height*2}:force_original_aspect_ratio=increase,"
+                f"crop={width*2}:{height*2},"
+                f"zoompan=z='{zoom_e}':x='{x_e}':y='{y_e}'"
+                f":d={frames}:s={width}x{height}:fps={fps},"
+                f"setsar=1"
+            )
+            self._run([
+                "ffmpeg", "-y",
+                "-loop", "1", "-i", img,
+                "-vf", vf,
+                "-t", str(seg_dur),
+                "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+                "-pix_fmt", "yuv420p",
+                clip_path,
+            ], f"Ken Burns clip {i}")
+            kb_clips.append(clip_path)
+
+        if n == 1:
+            return kb_clips[0]
+
+        return self._crossfade_clips(
+            kb_clips, output_path, fps, xfade_dur, seg_dur, duration, width, height
+        )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Shared helpers
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _crossfade_clips(self, clips, output_path, fps, xfade_dur, seg_dur, total_dur, w, h):
         try:
-            n = len(clips)
-            # Build inputs
+            n   = len(clips)
             cmd = ["ffmpeg", "-y"]
             for c in clips:
                 cmd += ["-i", c]
 
-            # Build filtergraph:
-            # Each clip feeds into the next xfade; offset accumulates
             fg_parts = []
-            # Label first input
-            prev = "[0:v]"
-            accumulated_offset = 0.0
-
+            prev     = "[0:v]"
+            offset   = 0.0
             for i in range(1, n):
-                accumulated_offset += seg_dur - xfade_dur
+                offset += seg_dur - xfade_dur
                 out_label = f"[xf{i}]" if i < n - 1 else "[vout]"
                 fg_parts.append(
                     f"{prev}[{i}:v]xfade=transition=fade:"
-                    f"duration={xfade_dur}:offset={accumulated_offset:.3f}{out_label}"
+                    f"duration={xfade_dur}:offset={offset:.3f}{out_label}"
                 )
                 prev = out_label
 
@@ -254,20 +276,18 @@ class VideoMCPServer:
             cmd += [
                 "-filter_complex", ";".join(fg_parts),
                 "-map", "[vout]",
-                "-t", str(total_audio_dur),
+                "-t", str(total_dur),
                 "-c:v", "libx264", "-preset", "fast", "-crf", "22",
                 "-pix_fmt", "yuv420p",
                 merged,
             ]
             self._run(cmd, "crossfade chain")
             return merged
-
         except Exception as e:
             logger.warning(f"Crossfade failed ({e}), falling back to simple concat")
-            return self._simple_concat(clips, output_path, total_audio_dur)
+            return self._simple_concat(clips, output_path, total_dur)
 
     def _simple_concat(self, clips, output_path, duration):
-        """Fallback: plain concat without transitions."""
         list_path = output_path.replace(".mp4", "_list.txt")
         merged    = output_path.replace(".mp4", "_merged.mp4")
         with open(list_path, "w") as f:
@@ -284,7 +304,22 @@ class VideoMCPServer:
             os.remove(list_path)
         return merged
 
-    # ── utilities ─────────────────────────────────────────────────────────────
+    def _caption_filter(self, subtitle_path):
+        if not subtitle_path or not os.path.exists(subtitle_path):
+            return None
+        ext = Path(subtitle_path).suffix.lower()
+        if ext == ".ass":
+            # Escape Windows-style backslashes for FFmpeg on Linux
+            safe_path = subtitle_path.replace("\\", "/")
+            return f"ass='{safe_path}'"
+        # SRT with bold white pop-style captions — looks like modern Shorts
+        return (
+            f"subtitles='{subtitle_path}':"
+            f"force_style='FontName=Arial,FontSize=58,Bold=1,"
+            f"PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
+            f"Outline=4,Shadow=2,Alignment=2,"
+            f"MarginV=150,MarginL=60,MarginR=60'"
+        )
 
     def _audio_duration(self, path: str) -> float:
         try:
@@ -299,9 +334,9 @@ class VideoMCPServer:
             return 55.0
 
     def _run(self, cmd: list, step: str):
-        logger.debug(f"FFmpeg [{step}]: {' '.join(cmd[:8])}…")
+        logger.debug(f"FFmpeg [{step}]: {' '.join(cmd[:10])}…")
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if r.returncode != 0:
-            logger.error(f"FFmpeg [{step}] failed:\n{r.stderr[-1500:]}")
+            logger.error(f"FFmpeg [{step}] failed:\n{r.stderr[-2000:]}")
             raise RuntimeError(f"FFmpeg [{step}] failed: {r.stderr[-600:]}")
         return r

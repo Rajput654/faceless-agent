@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       video_count:
-        description: 'Number of videos'
+        description: 'Number of videos (1-10)'
         required: false
         default: '10'
       niche:
@@ -24,6 +24,9 @@ on:
 env:
   PYTHON_VERSION: '3.11'
   NICHE: ${{ github.event.inputs.niche || 'motivation' }}
+  # FIX: DAILY_VIDEO_COUNT is now propagated to every job so main.py and
+  # individual matrix jobs can read it. Previously this was set but never
+  # consumed by main.py, so config defaulted to 10 regardless.
   DAILY_VIDEO_COUNT: ${{ github.event.inputs.video_count || '10' }}
 
 jobs:
@@ -32,6 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       topics_count: ${{ steps.research.outputs.topics_count }}
+      video_count:  ${{ steps.research.outputs.video_count }}
     steps:
       - uses: actions/checkout@v4
 
@@ -78,10 +82,19 @@ jobs:
           REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
           REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
           NICHE: ${{ env.NICHE }}
+          DAILY_VIDEO_COUNT: ${{ env.DAILY_VIDEO_COUNT }}
         run: |
-          python main.py --mode research --niche "$NICHE" --topics-file topics.json
+          # FIX: pass --count so main.py only generates the requested number of topics
+          python main.py \
+            --mode research \
+            --niche "$NICHE" \
+            --count "$DAILY_VIDEO_COUNT" \
+            --topics-file topics.json
+
           COUNT=$(python -c "import json; print(len(json.load(open('topics.json'))))")
           echo "topics_count=$COUNT" >> $GITHUB_OUTPUT
+          echo "video_count=$DAILY_VIDEO_COUNT" >> $GITHUB_OUTPUT
+          echo "Researched $COUNT topics for $DAILY_VIDEO_COUNT videos"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -104,6 +117,9 @@ jobs:
     strategy:
       fail-fast: false
       max-parallel: 5
+      # Matrix is always 0-9 because GitHub Actions does not support
+      # dynamic matrix sizes. Individual jobs skip themselves when their
+      # index is >= DAILY_VIDEO_COUNT (see "Skip if index out of range" step).
       matrix:
         video_index: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 
@@ -115,31 +131,52 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
 
+      # FIX: Check index BEFORE installing anything to save runner minutes.
+      # If video_count=2, jobs for indices 2-9 exit here immediately without
+      # installing ffmpeg, pip packages, or running any Python.
+      - name: Skip if index out of range
+        run: |
+          VIDEO_COUNT="${{ env.DAILY_VIDEO_COUNT }}"
+          VIDEO_INDEX=${{ matrix.video_index }}
+          if [ "$VIDEO_INDEX" -ge "$VIDEO_COUNT" ]; then
+            echo "⏭️  Skipping video $VIDEO_INDEX — only $VIDEO_COUNT video(s) requested."
+            echo "SKIP=true" >> $GITHUB_ENV
+          else
+            echo "▶️  Processing video $VIDEO_INDEX of $VIDEO_COUNT"
+            echo "SKIP=false" >> $GITHUB_ENV
+          fi
+
       - name: Install FFmpeg
+        if: env.SKIP == 'false'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg
           ffmpeg -version | head -1
 
       - name: Install Python dependencies
+        if: env.SKIP == 'false'
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
 
       - uses: actions/download-artifact@v4
+        if: env.SKIP == 'false'
         with:
           name: topics-queue
 
       - uses: actions/download-artifact@v4
+        if: env.SKIP == 'false'
         with:
           name: kokoro-models
 
       - name: Verify Kokoro models present
+        if: env.SKIP == 'false'
         run: |
           ls -lh kokoro-v1.0.onnx voices.bin
           echo "Kokoro models ready ✅"
 
       - name: Verify environment
+        if: env.SKIP == 'false'
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
@@ -154,12 +191,14 @@ jobs:
           print(f'Topic [{idx}]: {t[idx].get(\"topic\", \"?\")}')
           "
           echo "NICHE: ${{ env.NICHE }}"
+          echo "DAILY_VIDEO_COUNT: ${{ env.DAILY_VIDEO_COUNT }}"
           [ -n "$GROQ_API_KEY"   ] && echo "✅ GROQ_API_KEY"   || echo "❌ GROQ_API_KEY MISSING"
           [ -n "$PEXELS_API_KEY" ] && echo "✅ PEXELS_API_KEY" || echo "⚠️  PEXELS_API_KEY not set"
           which ffmpeg  && echo "✅ ffmpeg"  || echo "❌ ffmpeg MISSING"
           which ffprobe && echo "✅ ffprobe" || echo "❌ ffprobe MISSING"
 
       - name: Generate Video
+        if: env.SKIP == 'false'
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
@@ -167,6 +206,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           NICHE: ${{ env.NICHE }}
+          DAILY_VIDEO_COUNT: ${{ env.DAILY_VIDEO_COUNT }}
         run: |
           VIDEO_ID="video_$(printf '%03d' ${{ matrix.video_index }})"
           set -o pipefail
@@ -179,14 +219,13 @@ jobs:
             --no-upload
 
       - name: Debug output files
-        if: always()
+        if: always() && env.SKIP == 'false'
         run: |
           find /tmp -name "*.mp4" -exec ls -lh {} \; 2>/dev/null || echo "None"
           find /tmp -name "*.mp3" -exec ls -lh {} \; 2>/dev/null || echo "None"
 
-      # FIX: Rename the video to a predictable flat filename before uploading.
-      # The artifact download in upload-youtube uses this exact name.
       - name: Stage video for artifact upload
+        if: env.SKIP == 'false'
         run: |
           VIDEO_IDX=${{ matrix.video_index }}
           VIDEO_PATH="/tmp/video_$(printf '%03d' ${VIDEO_IDX})_final.mp4"
@@ -195,14 +234,12 @@ jobs:
             ls -lh /tmp/ 2>/dev/null || true
             exit 1
           fi
-          # Copy to a flat filename so artifact download is unambiguous
           cp "$VIDEO_PATH" "/tmp/video_${VIDEO_IDX}_final.mp4"
           SIZE=$(stat -c%s "/tmp/video_${VIDEO_IDX}_final.mp4")
           echo "✅ Staged: /tmp/video_${VIDEO_IDX}_final.mp4 (${SIZE} bytes)"
 
-      # FIX: artifact name is now "video-{index}" and path matches exactly.
-      # Using if-no-files-found: error so failures are visible, not silent.
       - uses: actions/upload-artifact@v4
+        if: env.SKIP == 'false'
         with:
           name: video-${{ matrix.video_index }}
           path: /tmp/video_${{ matrix.video_index }}_final.mp4
@@ -213,8 +250,6 @@ jobs:
     name: Upload Video ${{ matrix.video_index }}
     runs-on: ubuntu-latest
     needs: generate-videos
-    # FIX: always() allows the upload job to run even if some generate jobs
-    # failed, so successfully generated videos still get uploaded.
     if: always() && needs.generate-videos.result != 'skipped'
     strategy:
       fail-fast: false
@@ -230,14 +265,27 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
 
+      # FIX: Same skip-early pattern — don't bother checking artifacts for
+      # indices that were never generated.
+      - name: Skip if index out of range
+        run: |
+          VIDEO_COUNT="${{ env.DAILY_VIDEO_COUNT }}"
+          VIDEO_INDEX=${{ matrix.video_index }}
+          if [ "$VIDEO_INDEX" -ge "$VIDEO_COUNT" ]; then
+            echo "⏭️  Skipping upload $VIDEO_INDEX — only $VIDEO_COUNT video(s) requested."
+            echo "SKIP=true" >> $GITHUB_ENV
+          else
+            echo "SKIP=false" >> $GITHUB_ENV
+          fi
+
       - name: Install Python dependencies
+        if: env.SKIP == 'false'
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      # FIX: pattern=ignore means the step won't fail if artifact is missing
-      # (e.g. video_3 failed to generate — we skip it and upload the rest).
       - name: Check if artifact exists
+        if: env.SKIP == 'false'
         id: check_artifact
         uses: actions/download-artifact@v4
         with:
@@ -246,19 +294,17 @@ jobs:
         continue-on-error: true
 
       - name: Skip if video was not generated
-        if: steps.check_artifact.outcome == 'failure'
+        if: env.SKIP == 'false' && steps.check_artifact.outcome == 'failure'
         run: |
           echo "⚠️  Artifact video-${{ matrix.video_index }} not found — skipping upload."
-          echo "This is expected if that video failed during generation."
 
       - uses: actions/download-artifact@v4
-        if: steps.check_artifact.outcome == 'success'
+        if: env.SKIP == 'false' && steps.check_artifact.outcome == 'success'
         with:
           name: topics-queue
 
-      # FIX: Restore the zero-padded filename that upload.py expects.
       - name: Restore expected filename
-        if: steps.check_artifact.outcome == 'success'
+        if: env.SKIP == 'false' && steps.check_artifact.outcome == 'success'
         run: |
           VIDEO_IDX=${{ matrix.video_index }}
           FLAT_PATH="/tmp/video_${VIDEO_IDX}_final.mp4"
@@ -276,11 +322,11 @@ jobs:
           ls -lh "$PADDED_PATH"
 
       - name: Stagger uploads (avoid quota burst)
-        if: steps.check_artifact.outcome == 'success'
+        if: env.SKIP == 'false' && steps.check_artifact.outcome == 'success'
         run: sleep $(( ${{ matrix.video_index }} * 90 ))
 
       - name: Upload to YouTube
-        if: steps.check_artifact.outcome == 'success'
+        if: env.SKIP == 'false' && steps.check_artifact.outcome == 'success'
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           YOUTUBE_CLIENT_ID_A: ${{ secrets.YOUTUBE_CLIENT_ID_A }}
@@ -290,6 +336,7 @@ jobs:
           YOUTUBE_CLIENT_SECRET_B: ${{ secrets.YOUTUBE_CLIENT_SECRET_B }}
           YOUTUBE_REFRESH_TOKEN_B: ${{ secrets.YOUTUBE_REFRESH_TOKEN_B }}
           NICHE: ${{ env.NICHE }}
+          DAILY_VIDEO_COUNT: ${{ env.DAILY_VIDEO_COUNT }}
         run: |
           python upload.py \
             --video-index ${{ matrix.video_index }} \

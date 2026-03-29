@@ -184,33 +184,44 @@ jobs:
           find /tmp -name "*.mp4" -exec ls -lh {} \; 2>/dev/null || echo "None"
           find /tmp -name "*.mp3" -exec ls -lh {} \; 2>/dev/null || echo "None"
 
-      - name: Verify video file
+      # FIX: Rename the video to a predictable flat filename before uploading.
+      # The artifact download in upload-youtube uses this exact name.
+      - name: Stage video for artifact upload
         run: |
-          VIDEO_PATH="/tmp/video_$(printf '%03d' ${{ matrix.video_index }})_final.mp4"
+          VIDEO_IDX=${{ matrix.video_index }}
+          VIDEO_PATH="/tmp/video_$(printf '%03d' ${VIDEO_IDX})_final.mp4"
           if [ ! -f "$VIDEO_PATH" ]; then
             echo "❌ Video not found: $VIDEO_PATH"
             ls -lh /tmp/ 2>/dev/null || true
             exit 1
           fi
-          SIZE=$(stat -c%s "$VIDEO_PATH")
-          echo "✅ $VIDEO_PATH ($SIZE bytes)"
+          # Copy to a flat filename so artifact download is unambiguous
+          cp "$VIDEO_PATH" "/tmp/video_${VIDEO_IDX}_final.mp4"
+          SIZE=$(stat -c%s "/tmp/video_${VIDEO_IDX}_final.mp4")
+          echo "✅ Staged: /tmp/video_${VIDEO_IDX}_final.mp4 (${SIZE} bytes)"
 
+      # FIX: artifact name is now "video-{index}" and path matches exactly.
+      # Using if-no-files-found: error so failures are visible, not silent.
       - uses: actions/upload-artifact@v4
-        if: success()
         with:
           name: video-${{ matrix.video_index }}
           path: /tmp/video_${{ matrix.video_index }}_final.mp4
+          if-no-files-found: error
           retention-days: 1
 
   upload-youtube:
     name: Upload Video ${{ matrix.video_index }}
     runs-on: ubuntu-latest
     needs: generate-videos
+    # FIX: always() allows the upload job to run even if some generate jobs
+    # failed, so successfully generated videos still get uploaded.
+    if: always() && needs.generate-videos.result != 'skipped'
     strategy:
       fail-fast: false
       max-parallel: 2
       matrix:
         video_index: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
     steps:
       - uses: actions/checkout@v4
 
@@ -224,19 +235,52 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - uses: actions/download-artifact@v4
+      # FIX: pattern=ignore means the step won't fail if artifact is missing
+      # (e.g. video_3 failed to generate — we skip it and upload the rest).
+      - name: Check if artifact exists
+        id: check_artifact
+        uses: actions/download-artifact@v4
         with:
           name: video-${{ matrix.video_index }}
           path: /tmp/
+        continue-on-error: true
+
+      - name: Skip if video was not generated
+        if: steps.check_artifact.outcome == 'failure'
+        run: |
+          echo "⚠️  Artifact video-${{ matrix.video_index }} not found — skipping upload."
+          echo "This is expected if that video failed during generation."
 
       - uses: actions/download-artifact@v4
+        if: steps.check_artifact.outcome == 'success'
         with:
           name: topics-queue
 
+      # FIX: Restore the zero-padded filename that upload.py expects.
+      - name: Restore expected filename
+        if: steps.check_artifact.outcome == 'success'
+        run: |
+          VIDEO_IDX=${{ matrix.video_index }}
+          FLAT_PATH="/tmp/video_${VIDEO_IDX}_final.mp4"
+          PADDED_PATH="/tmp/video_$(printf '%03d' ${VIDEO_IDX})_final.mp4"
+          if [ -f "$FLAT_PATH" ] && [ ! -f "$PADDED_PATH" ]; then
+            cp "$FLAT_PATH" "$PADDED_PATH"
+            echo "Restored: $PADDED_PATH"
+          elif [ -f "$PADDED_PATH" ]; then
+            echo "Already in place: $PADDED_PATH"
+          else
+            echo "❌ Neither $FLAT_PATH nor $PADDED_PATH found"
+            ls -lh /tmp/*.mp4 2>/dev/null || echo "No mp4 files in /tmp"
+            exit 1
+          fi
+          ls -lh "$PADDED_PATH"
+
       - name: Stagger uploads (avoid quota burst)
+        if: steps.check_artifact.outcome == 'success'
         run: sleep $(( ${{ matrix.video_index }} * 90 ))
 
       - name: Upload to YouTube
+        if: steps.check_artifact.outcome == 'success'
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           YOUTUBE_CLIENT_ID_A: ${{ secrets.YOUTUBE_CLIENT_ID_A }}

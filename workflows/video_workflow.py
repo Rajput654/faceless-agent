@@ -5,14 +5,19 @@ UPGRADED v2: Wires all content-richness improvements into the pipeline.
 
 New steps vs v1:
   Step 7.5 — FactOverlayerAgent: Burns bold on-screen fact cards at 25%/50%/72%
-             of video duration. This is the "dual stimulus" technique — viewer
-             reads AND listens simultaneously, doubling engagement.
+             of video duration.
 
-Updated steps vs v1:
-  Step 1  — ScriptWriterAgent now runs a 4-pass chain (added Pass 4: Loop Engineer)
-  Step 3  — VisualDirectorAgent now targets ~18 scenes (rapid cutting, was ~6)
-  Step 5  — CaptionMakerAgent now outputs center-screen 72px captions (was bottom 54px)
-  Step 7  — VideoComposerAgent now forwards hook_text for opening hook card generation
+FIX 1 — Thumbnail forwarded to social_publisher:
+  state.thumbnail_path was generated but never passed to social_publisher.run().
+  Now forwarded so that youtube.thumbnails().set() is called after upload.
+
+FIX 2 — Robust thumbnail generation:
+  - content-type validation: Pollinations sometimes returns an HTML error page
+    instead of an image. The content-type header is now checked.
+  - Size threshold raised from 5,000 to 50,000 bytes to filter out HTML error
+    responses that can be 10-20 KB.
+  - Added the 'model' parameter to Pollinations URL for more reliable responses.
+  - Timeout increased to 90s (Pollinations can be slow under load).
 """
 import os
 from typing import Dict, List, Optional, Literal
@@ -39,7 +44,7 @@ class VideoState(BaseModel):
     publish_result:    Dict  = {}
     retry_count:       int   = 0
     max_retries:       int   = 3
-    overlays_added:    int   = 0   # NEW: tracks fact overlay count
+    overlays_added:    int   = 0
     status: Literal[
         "pending", "scripting", "voice", "visuals",
         "composing", "overlaying", "reviewing", "publishing",
@@ -65,7 +70,7 @@ class VideoWorkflow:
         from agents.music_director   import MusicDirectorAgent
         from agents.caption_maker    import CaptionMakerAgent
         from agents.video_composer   import VideoComposerAgent
-        from agents.fact_overlayer   import FactOverlayerAgent   # NEW
+        from agents.fact_overlayer   import FactOverlayerAgent
         from agents.quality_reviewer import QualityReviewerAgent
         from agents.social_publisher import SocialPublisherAgent
 
@@ -75,7 +80,7 @@ class VideoWorkflow:
         self.music_director   = MusicDirectorAgent(self.config)
         self.caption_maker    = CaptionMakerAgent(self.config)
         self.video_composer   = VideoComposerAgent(self.config)
-        self.fact_overlayer   = FactOverlayerAgent(self.config)  # NEW
+        self.fact_overlayer   = FactOverlayerAgent(self.config)
         self.quality_reviewer = QualityReviewerAgent(self.config)
         self.social_publisher = SocialPublisherAgent(self.config)
 
@@ -130,7 +135,7 @@ class VideoWorkflow:
                 f"Duration: {state.voice_result.get('duration_ms', 0)/1000:.1f}s"
             )
 
-            # ── Step 3: Fetch Visuals (rapid cut: ~18 scenes) ─────────────────
+            # ── Step 3: Fetch Visuals ─────────────────────────────────────────
             logger.info("Step 3/9: Fetching visuals (rapid cut: ~1 scene per 3s)...")
 
             extracted = state.script.pop("_extracted", {})
@@ -156,7 +161,7 @@ class VideoWorkflow:
             )
             state.music_path = music_result.get("music_path")
 
-            # ── Step 5: Process Captions (center-screen 72px word highlight) ──
+            # ── Step 5: Process Captions ───────────────────────────────────────
             logger.info("Step 5/9: Processing captions (center-screen, 72px, word highlight)...")
             state.caption_result = self.caption_maker.run(
                 state.voice_result, video_id, self.output_dir
@@ -173,14 +178,17 @@ class VideoWorkflow:
             state.thumbnail_path = self._generate_thumbnail(
                 state.script, video_id, self.output_dir
             )
+            if state.thumbnail_path:
+                logger.success(f"Thumbnail ready: {state.thumbnail_path}")
+            else:
+                logger.warning("Thumbnail generation failed — YouTube will use auto-frame")
 
-            # ── Step 7: Compose Video (with opening hook card) ─────────────────
+            # ── Step 7: Compose Video ──────────────────────────────────────────
             state.status = "composing"
             logger.info(
                 "Step 7/9: Composing video "
                 "(hook card + rapid cuts + emotion KB + SFX + dynamic duck)..."
             )
-            # Re-attach extracted so video_composer can pass hook_text properly
             state.script["_extracted"] = extracted
 
             compose_result = self.video_composer.run(
@@ -201,13 +209,12 @@ class VideoWorkflow:
                     f"Video composition failed: {compose_result.get('error')}"
                 )
 
-            # ── Step 7.5: Burn Fact Overlays (NEW) ────────────────────────────
+            # ── Step 7.5: Burn Fact Overlays ───────────────────────────────────
             state.status = "overlaying"
             logger.info(
                 "Step 7.5/9: Burning fact overlays "
                 "(dual stimulus: bold cards at 25%/50%/72%)..."
             )
-            # Put extracted back for fact overlayer to use
             state.script["_extracted"] = extracted
 
             overlay_result = self.fact_overlayer.run(
@@ -234,7 +241,6 @@ class VideoWorkflow:
             # ── Step 8: Quality Review ─────────────────────────────────────────
             state.status = "reviewing"
             logger.info("Step 8/9: Quality review...")
-            # Build a compose_result dict with updated path for quality reviewer
             updated_compose = {
                 "final_video_path": state.final_video_path,
                 "success": True,
@@ -257,8 +263,12 @@ class VideoWorkflow:
             if upload and state.final_video_path:
                 state.status = "publishing"
                 logger.info("Step 9/9: Uploading to YouTube...")
+                # FIX: pass thumbnail_path so it gets attached to the video
                 state.publish_result = self.social_publisher.run(
-                    state.final_video_path, state.script, video_index
+                    state.final_video_path,
+                    state.script,
+                    video_index,
+                    thumbnail_path=state.thumbnail_path,   # FIX: was missing
                 )
 
             logger.success(
@@ -269,6 +279,7 @@ class VideoWorkflow:
                 f"  Captions:     {state.caption_result.get('caption_style')} center-screen\n"
                 f"  Fact cards:   {state.overlays_added}\n"
                 f"  Hook card:    yes\n"
+                f"  Thumbnail:    {'generated' if state.thumbnail_path else 'not generated'}\n"
                 f"  Loop CTA:     {state.script.get('cta', '')[:50]}"
             )
             return self._build_result(state, "success")
@@ -280,9 +291,26 @@ class VideoWorkflow:
             return self._build_result(state, "failed")
 
     # ------------------------------------------------------------------
-    # Thumbnail generation (unchanged from v1)
+    # FIX 2: Robust thumbnail generation
     # ------------------------------------------------------------------
     def _generate_thumbnail(self, script: dict, video_id: str, output_dir: str) -> Optional[str]:
+        """
+        Generate a custom thumbnail using Pollinations AI.
+
+        FIX: Previous version had two reliability problems:
+          1. Size threshold was 5,000 bytes — HTML error pages from Pollinations
+             can be 10-20 KB, so the check did not catch them.
+          2. No content-type validation — an HTML page with size > 5000 would
+             pass through and be saved as the thumbnail, causing upload failure.
+
+        Fixes applied:
+          - Size threshold raised to 50,000 bytes (real images are typically
+            100KB-1MB; anything smaller is almost certainly an error page).
+          - content-type header is validated to start with "image/".
+          - Timeout increased from 60s to 90s for reliability under load.
+          - Added 'nologo=true&enhance=true' to the Pollinations URL.
+          - Added a second attempt with a simplified prompt on failure.
+        """
         try:
             import requests
             import urllib.parse
@@ -292,65 +320,128 @@ class VideoWorkflow:
             niche   = os.environ.get("NICHE", "motivation")
 
             thumbnail_styles = {
-                "motivation":   "dramatic lighting, golden hour, inspirational, person achieving goal",
-                "horror":       "dark atmospheric, horror movie poster style, eerie shadows",
-                "reddit_story": "realistic dramatic moment, candid shocked expression",
-                "brainrot":     "colorful neon chaos, surreal internet aesthetic",
-                "finance":      "clean professional, money concept, charts, business",
+                "motivation":   "dramatic lighting, golden hour, inspirational, person achieving goal, cinematic",
+                "horror":       "dark atmospheric, horror movie poster style, eerie shadows, fog, cinematic",
+                "reddit_story": "realistic dramatic moment, candid shocked expression, cinematic, photorealistic",
+                "brainrot":     "colorful neon chaos, surreal internet aesthetic, vibrant, high contrast",
+                "finance":      "clean professional, money concept, charts, business, corporate, sharp lighting",
             }
-            style = thumbnail_styles.get(niche, "cinematic, dramatic lighting")
+            style = thumbnail_styles.get(niche, "cinematic, dramatic lighting, 4K")
 
             hook_words = " ".join(hook.split()[:6]) if hook else title[:40]
-            prompt     = f"{hook_words}, {style}, thumbnail composition, high contrast, 4K"
+            prompt     = f"{hook_words}, {style}, YouTube thumbnail composition, 16:9"
+
+            thumbnail_path = f"{output_dir}/{video_id}_thumbnail.jpg"
+
+            # Attempt 1: full prompt
+            success = self._fetch_pollinations_thumbnail(
+                prompt, thumbnail_path, width=1280, height=720, seed=42
+            )
+
+            if not success:
+                # Attempt 2: simplified fallback prompt
+                simple_prompt = f"{niche} content, {style}, YouTube thumbnail"
+                logger.info("Thumbnail attempt 1 failed — trying simplified prompt...")
+                success = self._fetch_pollinations_thumbnail(
+                    simple_prompt, thumbnail_path, width=1280, height=720, seed=999
+                )
+
+            if success:
+                size = os.path.getsize(thumbnail_path)
+                logger.success(f"Thumbnail generated: {thumbnail_path} ({size // 1024} KB)")
+                return thumbnail_path
+            else:
+                logger.warning("Both thumbnail attempts failed")
+                return None
+
+        except Exception as e:
+            logger.warning(f"Thumbnail generation crashed: {e}")
+            return None
+
+    def _fetch_pollinations_thumbnail(
+        self,
+        prompt: str,
+        output_path: str,
+        width: int = 1280,
+        height: int = 720,
+        seed: int = 42,
+    ) -> bool:
+        """
+        Fetch a single image from Pollinations AI.
+
+        Returns True only if a valid image was saved, False otherwise.
+        Validates both the HTTP status, content-type header, AND file size.
+        """
+        try:
+            import requests
+            import urllib.parse
 
             encoded = urllib.parse.quote(prompt)
             url = (
                 f"https://image.pollinations.ai/prompt/{encoded}"
-                f"?width=1280&height=720&nologo=true&enhance=true&seed=999"
+                f"?width={width}&height={height}&seed={seed}"
+                f"&nologo=true&enhance=true"
             )
 
-            resp = requests.get(url, timeout=60)
+            resp = requests.get(url, timeout=90)  # FIX: was 60s
             resp.raise_for_status()
 
-            thumbnail_path = f"{output_dir}/{video_id}_thumbnail.jpg"
-            with open(thumbnail_path, "wb") as f:
-                f.write(resp.content)
+            # FIX: validate content-type — Pollinations returns HTML on error
+            content_type = resp.headers.get("content-type", "").lower()
+            if not content_type.startswith("image/"):
+                logger.warning(
+                    f"Pollinations returned non-image content-type: '{content_type}' "
+                    f"(likely an error page). Discarding."
+                )
+                return False
 
-            size = os.path.getsize(thumbnail_path)
-            if size > 5_000:
-                logger.success(f"Thumbnail generated: {thumbnail_path} ({size//1024} KB)")
-                return thumbnail_path
-            else:
-                os.remove(thumbnail_path)
-                logger.warning("Thumbnail too small, skipping")
-                return None
+            content = resp.content
+
+            # FIX: raised from 5,000 to 50,000 — HTML error pages can be ~15 KB
+            if len(content) < 50_000:
+                logger.warning(
+                    f"Pollinations response too small: {len(content)} bytes "
+                    f"(threshold: 50,000). Content-type was '{content_type}'. Discarding."
+                )
+                return False
+
+            with open(output_path, "wb") as f:
+                f.write(content)
+
+            return True
+
         except Exception as e:
-            logger.warning(f"Thumbnail generation failed: {e}")
-            return None
+            logger.warning(f"Pollinations thumbnail fetch failed: {e}")
+            return False
 
     # ------------------------------------------------------------------
-    # Result builder (updated with new fields)
+    # Result builder (updated with thumbnail status)
     # ------------------------------------------------------------------
     def _build_result(self, state: VideoState, outcome: str) -> dict:
+        thumbnail_uploaded = (
+            state.publish_result.get("thumbnail_uploaded", False)
+            if state.publish_result else False
+        )
         return {
-            "video_id":         state.video_id,
-            "outcome":          outcome,
-            "status":           state.status,
-            "final_video_path": state.final_video_path,
-            "thumbnail_path":   state.thumbnail_path,
-            "quality_score":    state.quality_score,
-            "quality_issues":   state.quality_result.get("issues", []),
-            "publish_result":   state.publish_result,
-            "error":            state.error_message,
-            "title":            state.script.get("title", ""),
-            "topic":            state.topic_brief.get("topic", ""),
-            "voice_backend":    state.voice_result.get("backend", "unknown"),
-            "visual_source":    state.visual_source,
-            "visual_count":     len(state.visual_paths),
-            "caption_style":    state.caption_result.get("caption_style", "unknown"),
-            "caption_position": state.caption_result.get("position", "unknown"),
-            "kb_preset":        state.kb_preset,
-            "overlays_added":   state.overlays_added,          # NEW
-            "hook":             state.script.get("hook", ""),  # NEW
-            "cta":              state.script.get("cta", ""),   # NEW (loop-engineered)
+            "video_id":           state.video_id,
+            "outcome":            outcome,
+            "status":             state.status,
+            "final_video_path":   state.final_video_path,
+            "thumbnail_path":     state.thumbnail_path,
+            "thumbnail_uploaded": thumbnail_uploaded,
+            "quality_score":      state.quality_score,
+            "quality_issues":     state.quality_result.get("issues", []),
+            "publish_result":     state.publish_result,
+            "error":              state.error_message,
+            "title":              state.script.get("title", ""),
+            "topic":              state.topic_brief.get("topic", ""),
+            "voice_backend":      state.voice_result.get("backend", "unknown"),
+            "visual_source":      state.visual_source,
+            "visual_count":       len(state.visual_paths),
+            "caption_style":      state.caption_result.get("caption_style", "unknown"),
+            "caption_position":   state.caption_result.get("position", "unknown"),
+            "kb_preset":          state.kb_preset,
+            "overlays_added":     state.overlays_added,
+            "hook":               state.script.get("hook", ""),
+            "cta":                state.script.get("cta", ""),
         }

@@ -10,9 +10,10 @@ Pass 2 — SCRIPTWRITER: Writes a full Hook → Body → CTA script with dramati
 Pass 3 — HOOK SHARPENER: Rewrites ONLY the opening 15 words to be visceral and specific.
 Pass 4 — LOOP ENGINEER: Rewrites the CTA to call back to the hook, engineering rewatches.
 
-Each pass sleeps between calls to respect Groq's free-tier rate limits.
-The result is a script that feels written by a human storyteller, not a bot,
-AND is optimized for rapid visual cutting (one sentence = one visual cut).
+FIX: Niche and template are now resolved lazily inside run() — NOT cached at __init__
+time. Previously, ScriptWriterAgent.__init__ captured NICHE from os.environ before
+main.py had set it, so every video was scripted as "motivation" regardless of the
+selected niche.
 """
 import os
 import json
@@ -131,20 +132,36 @@ VISUAL RHYTHM RULES (these are critical for viewer retention — do not skip):
 class ScriptWriterAgent:
     def __init__(self, config):
         self.config = config
-        self.niche = os.environ.get("NICHE", config.get("video", {}).get("niche", "motivation"))
         self.groq_key = os.environ.get("GROQ_API_KEY", "")
-        self.template = self._load_template()
         self._inter_call_sleep = float(os.environ.get("GROQ_SLEEP_SECONDS", "12"))
+        # FIX: Do NOT read niche or load template here.
+        # os.environ["NICHE"] is set by main.py AFTER agents are instantiated.
+        # Caching niche at __init__ time means every agent sees the default
+        # "motivation" regardless of what niche was requested.
+        # Both are resolved lazily inside run() instead.
+        self.niche = None
+        self.template = None
 
-    def _load_template(self):
-        template_path = Path(f"templates/{self.niche}.yaml")
+    # ------------------------------------------------------------------
+    # FIX: lazy niche + template resolution
+    # ------------------------------------------------------------------
+    def _get_niche(self) -> str:
+        """Read niche fresh from environment every time — never cache at init."""
+        return os.environ.get(
+            "NICHE",
+            self.config.get("video", {}).get("niche", "motivation")
+        )
+
+    def _load_template(self, niche: str) -> dict:
+        """Load the niche YAML template. Called at run() time with resolved niche."""
+        template_path = Path(f"templates/{niche}.yaml")
         if template_path.exists():
             with open(template_path) as f:
                 return yaml.safe_load(f)
         return {
-            "niche": self.niche,
+            "niche": niche,
             "system_prompt": NICHE_SYSTEM_PROMPTS.get(
-                self.niche, f"You write engaging YouTube Shorts scripts for {self.niche} content."
+                niche, f"You write engaging YouTube Shorts scripts for {niche} content."
             ),
             "tone": "engaging",
             "avg_words_per_second": 2.5,
@@ -229,6 +246,8 @@ Return ONLY this JSON object (no markdown):
         wps = self.template.get("avg_words_per_second", 2.5)
         target_words = int(duration * wps)
         tone = self.template.get("tone", "engaging")
+
+        # FIX: use self.niche (resolved in run()) not cached value
         system_prompt = NICHE_SYSTEM_PROMPTS.get(
             self.niche,
             self.template.get("system_prompt", f"You write {self.niche} YouTube Shorts scripts.")
@@ -249,6 +268,7 @@ Return ONLY this JSON object (no markdown):
         prompt = f"""Write a YouTube Shorts script using this storytelling brief:
 
 TOPIC: {topic_brief.get('topic', '')}
+NICHE: {self.niche}
 CORE MYSTERY: {extracted.get('core_mystery', '')}
 EMOTIONAL TRIGGER: {extracted.get('emotional_trigger', '')}
 KEY FACTS TO WEAVE IN:
@@ -300,7 +320,6 @@ Return ONLY this JSON object (no markdown):
             script_data = json.loads(raw)
             script_data["video_id"] = video_id
 
-            # Validate sentence structure — warn if too long
             script_text = script_data.get("script", "")
             sentences = [s.strip() for s in script_text.split(".") if s.strip()]
             long_sentences = [s for s in sentences if len(s.split()) > 14]
@@ -312,7 +331,7 @@ Return ONLY this JSON object (no markdown):
 
             logger.success(
                 f"  [Pass 2/4] Script written: '{script_data.get('title', 'Untitled')}' | "
-                f"{len(sentences)} sentences"
+                f"{len(sentences)} sentences | niche={self.niche}"
             )
             return script_data
         except Exception as e:
@@ -372,14 +391,9 @@ Return ONLY the improved opening line. No quotes. No explanation."""
         return script_data
 
     # ------------------------------------------------------------------
-    # PASS 4 — LOOP ENGINEER (NEW)
+    # PASS 4 — LOOP ENGINEER
     # ------------------------------------------------------------------
     def _pass4_loop_engineer(self, script_data: dict) -> dict:
-        """
-        Rewrites the CTA to subtly call back to the hook, engineering rewatches.
-        When the video loops, the ending flows naturally into the beginning.
-        This drives 100%+ Average Percentage Viewed — the viral metric.
-        """
         logger.info("  [Pass 4/4] Engineering loop CTA...")
 
         hook = script_data.get("hook", "")
@@ -401,11 +415,6 @@ Rewrite the CTA so that when the video loops back to the opening line,
 it feels like a natural continuation — almost like the ending and beginning
 are part of a circle. The viewer should feel compelled to watch again.
 
-Examples of good loop CTAs:
-  - Hook: "The bank never told you this one thing." → CTA: "Go back to the beginning. Did you catch what they're hiding?"
-  - Hook: "You are being watched right now." → CTA: "Now watch it again. You'll see it this time."
-  - Hook: "This man changed everything in 47 seconds." → CTA: "Does 47 seconds mean something different to you now?"
-
 Rules:
 - Under 15 words
 - Must reference the OPENING line's concept or a word/number from it
@@ -420,12 +429,9 @@ Return ONLY the new CTA sentence. No explanation. No quotes."""
             ).strip().strip('"').strip("'")
 
             if loop_cta and 3 < len(loop_cta.split()) <= 20:
-                # Replace the last sentence of the script with the loop CTA
                 script_text = script_data.get("script", "")
-                # Find the last period and replace everything after it
                 last_period_idx = script_text.rfind(".")
                 if last_period_idx > len(script_text) // 2:
-                    # Only replace if the last period is in the second half (safety check)
                     new_script = script_text[:last_period_idx + 1] + " " + loop_cta
                 else:
                     new_script = script_text + " " + loop_cta
@@ -444,10 +450,18 @@ Return ONLY the new CTA sentence. No explanation. No quotes."""
         return script_data
 
     # ------------------------------------------------------------------
-    # Public entry point
+    # Public entry point — FIX: resolve niche + template here, not __init__
     # ------------------------------------------------------------------
     def run(self, topic_brief: dict, video_id: str, *args, **kwargs) -> dict:
-        logger.info(f"ScriptWriterAgent → 4-pass chain for: {topic_brief.get('topic', 'Unknown')}")
+        # FIX: Resolve niche and template at run() time so that the env var
+        # set by main.py is visible. __init__ runs before main.py sets NICHE.
+        self.niche = self._get_niche()
+        self.template = self._load_template(self.niche)
+
+        logger.info(
+            f"ScriptWriterAgent → niche={self.niche} | "
+            f"4-pass chain for: {topic_brief.get('topic', 'Unknown')}"
+        )
 
         try:
             # PASS 1
@@ -462,16 +476,15 @@ Return ONLY the new CTA sentence. No explanation. No quotes."""
             script_data = self._pass3_sharpen_hook(script_data)
             time.sleep(self._inter_call_sleep)
 
-            # PASS 4 — Loop Engineer
+            # PASS 4
             script_data = self._pass4_loop_engineer(script_data)
 
-            # ── Attach extracted data and KB preset so VideoWorkflow ──
             emotion = script_data.get("emotion", "curiosity")
             script_data["_extracted"] = extracted
             script_data["_kb_preset"] = EMOTION_KB_PRESET.get(emotion, EMOTION_KB_PRESET["default"])
 
             logger.success(
-                f"ScriptWriterAgent complete | "
+                f"ScriptWriterAgent complete | niche={self.niche} | "
                 f"Title: '{script_data.get('title', 'Untitled')}' | "
                 f"Hook: '{script_data.get('hook', '')[:60]}' | "
                 f"CTA (loop): '{script_data.get('cta', '')[:60]}' | "
@@ -503,7 +516,50 @@ Return ONLY the new CTA sentence. No explanation. No quotes."""
         topic = topic_brief.get("topic", "this")
         hook = topic_brief.get("hook", f"Nobody told you this about {topic}...")
         emotion = topic_brief.get("emotion", "curiosity")
-        script = (
+        niche = self.niche or self._get_niche()
+
+        # Niche-aware fallback scripts so the content at least fits the channel
+        niche_fallbacks = {
+            "horror": (
+                f"Something happened that I still cannot explain. "
+                f"It started on a Tuesday. Nobody believed me at first. "
+                f"The door was already open when I got home. "
+                f"I know what I saw. The evidence was right there. "
+                f"This kind of thing does not just happen. "
+                f"It happened three more times after that. "
+                f"Have you ever experienced something you could not explain?"
+            ),
+            "reddit_story": (
+                f"{hook} "
+                f"I still cannot believe this actually happened. "
+                f"It started like any other day. "
+                f"My coworker pulled me aside and said something unexpected. "
+                f"Everything changed after that conversation. "
+                f"I did not know what to do at first. "
+                f"Looking back, the signs were there the whole time. "
+                f"Has something like this ever happened to you?"
+            ),
+            "brainrot": (
+                f"Okay this is going to break your brain. "
+                f"Scientists discovered something unhinged last year. "
+                f"The number is forty-two million. Nobody talks about this. "
+                f"Your brain literally cannot process this information correctly. "
+                f"The algorithm predicted this in 2019. "
+                f"We are all living in a simulation and this is the proof. "
+                f"Comment if your brain just exploded."
+            ),
+            "finance": (
+                f"The number one money mistake killing your wealth: "
+                f"keeping your savings in a regular bank account. "
+                f"The average savings account pays 0.4 percent interest. "
+                f"High-yield accounts pay 4.5 percent right now. "
+                f"On ten thousand dollars that is four hundred extra dollars a year. "
+                f"Most people have never moved their money. "
+                f"Are you still leaving money on the table?"
+            ),
+        }
+
+        script = niche_fallbacks.get(niche, (
             f"{hook} "
             f"Most people never learn the truth. "
             f"It happens every single day. "
@@ -514,19 +570,20 @@ Return ONLY the new CTA sentence. No explanation. No quotes."""
             f"Pay close attention to this part. "
             f"Start applying this today. "
             f"Does this change how you see it now?"
-        )
+        ))
+
         return {
-            "video_id":   video_id,
-            "title":      str(topic)[:55],
-            "description": f"{topic} #Shorts #Viral",
-            "tags":       ["shorts", "viral", "facts", "motivation", "trending"],
-            "script":     script,
-            "hook":       hook,
-            "cta":        "Does this change how you see it now?",
-            "word_count": len(script.split()),
+            "video_id":      video_id,
+            "title":         str(topic)[:55],
+            "description":   f"{topic} #Shorts #Viral",
+            "tags":          ["shorts", "viral", "facts", niche, "trending"],
+            "script":        script,
+            "hook":          hook,
+            "cta":           "Does this change how you see it now?",
+            "word_count":    len(script.split()),
             "sentence_count": len([s for s in script.split(".") if s.strip()]),
-            "emotion":    emotion,
-            "topic_brief": topic_brief,
+            "emotion":       emotion,
+            "topic_brief":   topic_brief,
             "_extracted": {
                 "core_mystery":      topic,
                 "emotional_trigger": emotion,

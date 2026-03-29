@@ -11,17 +11,18 @@ UPGRADED v2 with four improvements on top of v1:
 
 3. EMOTION-AWARE KEN BURNS (from v1, preserved)
 
-4. DYNAMIC MUSIC DUCKING (FIXED v3)
-   Four bugs fixed that caused music to be silently dropped:
-   BUG 1: volume_expr was wrapped in single quotes inside filter_complex string,
-          breaking ffmpeg's filter parser on Linux → filter fails → fallback → voice only.
-          FIX: commas inside the expr are escaped with \, (ffmpeg filter escaping).
-   BUG 2: amix used duration=first which truncates music to voice length, then
-          -shortest on the final compose also cut it. FIX: duration=longest + -t.
-   BUG 3: Music shorter than voice got silently dropped by duration=first.
-          FIX: aloop the music track before trimming so it always fills duration.
-   BUG 4: No diagnostic logging — failures were invisible in CI.
-          FIX: Added size checks and explicit error logging on both mix paths.
+4. DYNAMIC MUSIC DUCKING (FIXED v4)
+   ROOT CAUSE FIX: aloop filter used size=2e+09 (Python float) which ffmpeg
+   receives as the string "2e+09" — NOT a valid integer for the aloop size
+   parameter. ffmpeg rejects scientific notation silently, the entire
+   filter_complex fails, both the dynamic mix and simple fallback attempts
+   fail identically, and the function falls back to voice_path (no music).
+   FIX: All three occurrences of size=2e+09 replaced with size=2000000000
+   (a plain Python int that formats as the string "2000000000" in f-strings).
+   This affects:
+     - _dynamic_music_mix primary filter_complex
+     - _dynamic_music_mix simple fallback filter_complex
+     - _apply_sfx_layer rumble aloop filter
 
 5. SFX LAYER (from v1, preserved)
 
@@ -171,7 +172,7 @@ class VideoMCPServer:
                     kb_preset=_kb_preset
                 )
 
-            # ── NEW: Prepend opening hook card ────────────────────────────────
+            # ── Prepend opening hook card ─────────────────────────────────────
             if hook_text:
                 hook_card = self._generate_hook_card(
                     hook_text, output_path, width, height, fps
@@ -185,7 +186,7 @@ class VideoMCPServer:
                         duration += 0.7
                         logger.success(f"Hook card prepended ✅ (+0.7s)")
 
-            # ── Dynamic music ducking (FIXED) ─────────────────────────────────
+            # ── Dynamic music ducking (FIXED v4) ──────────────────────────────
             if music_path and os.path.exists(music_path):
                 music_size = os.path.getsize(music_path)
                 logger.info(
@@ -218,14 +219,12 @@ class VideoMCPServer:
             # ── Subtitle filter ───────────────────────────────────────────────
             vf_final, sub_tmp = self._caption_filter(subtitle_path, output_path)
 
-            # BUG FIX 2: removed -shortest flag — it cut audio at video length.
-            # Instead use -t with the exact duration so both streams play fully.
             compose_cmd = [
                 "ffmpeg", "-y",
                 "-i", merged, "-i", final_audio,
                 "-c:v", "libx264", "-preset", "fast", "-crf", "21",
                 "-c:a", "aac", "-b:a", "192k",
-                "-t", str(duration),           # explicit duration, no -shortest
+                "-t", str(duration),
                 "-movflags", "+faststart",
             ]
             if vf_final:
@@ -363,7 +362,12 @@ class VideoMCPServer:
             return None
 
     # ─────────────────────────────────────────────────────────────────────────
-    # FIXED: Dynamic music ducking
+    # FIXED v4: Dynamic music ducking
+    # ROOT CAUSE: size=2e+09 is a Python float. In an f-string it becomes the
+    # string "2e+09" which ffmpeg's aloop filter rejects (needs a plain int).
+    # Both the primary mix and the simple fallback had this bug, so both
+    # failed and the function always returned voice_path (no music).
+    # FIX: use 2000000000 (plain int) → formats as "2000000000" in f-strings.
     # ─────────────────────────────────────────────────────────────────────────
 
     def _dynamic_music_mix(self, voice_path, music_path, output_path,
@@ -374,12 +378,7 @@ class VideoMCPServer:
         ramp_out_start = max(ramp_in_end + 1, duration - 5.0)
         ramp_out_end   = max(ramp_out_start + 1, duration - 1.0)
 
-        # BUG FIX 1: Commas inside ffmpeg filter expressions must be escaped
-        # with \, when the expression is part of a larger filter_complex string.
-        # The old code wrapped the expr in single quotes ('...') which is NOT
-        # valid ffmpeg filter syntax — it's a shell quoting concept that ffmpeg
-        # does not understand. This caused the entire filter_complex to fail,
-        # which silently fell back to voice-only audio.
+        # Commas inside ffmpeg filter expressions must be escaped with \,
         volume_expr = (
             f"if(lt(t\\,{ramp_in_end:.1f})\\,"
             f"{base_volume:.3f}*t/{ramp_in_end:.1f}\\,"
@@ -398,11 +397,7 @@ class VideoMCPServer:
         )
 
         try:
-            # BUG FIX 2: aloop the music so it always covers full duration
-            # regardless of music file length. atrim clips it to exact duration.
-            # amix duration=longest ensures neither stream cuts the other short.
-            # dropout_transition=0 prevents abrupt cutoff artefacts.
-            # -t sets the final output duration explicitly.
+            # FIX: size=2000000000 (int) instead of size=2e+09 (float/scientific)
             self._run([
                 "ffmpeg", "-y",
                 "-i", voice_path,
@@ -410,7 +405,7 @@ class VideoMCPServer:
                 "-filter_complex",
                 (
                     f"[0:a]volume=1.0[voice];"
-                    f"[1:a]aloop=loop=-1:size=2e+09,"
+                    f"[1:a]aloop=loop=-1:size=2000000000,"
                     f"atrim=duration={duration:.3f},"
                     f"volume={volume_expr}[music_ducked];"
                     f"[voice][music_ducked]amix=inputs=2:duration=longest:dropout_transition=0[out]"
@@ -421,7 +416,6 @@ class VideoMCPServer:
                 mixed_path,
             ], "dynamic music mix")
 
-            # BUG FIX 4: validate the output actually contains music
             size = os.path.getsize(mixed_path) if os.path.exists(mixed_path) else 0
             if size < 10_000:
                 raise RuntimeError(
@@ -438,7 +432,7 @@ class VideoMCPServer:
                 f"Retrying with simple flat mix (no ducking ramp)..."
             )
             try:
-                # BUG FIX 3: simple fallback also loops music and uses duration=longest
+                # FIX: size=2000000000 (int) instead of size=2e+09 (float/scientific)
                 self._run([
                     "ffmpeg", "-y",
                     "-i", voice_path,
@@ -446,7 +440,7 @@ class VideoMCPServer:
                     "-filter_complex",
                     (
                         f"[0:a]volume=1.0[v];"
-                        f"[1:a]aloop=loop=-1:size=2e+09,"
+                        f"[1:a]aloop=loop=-1:size=2000000000,"
                         f"atrim=duration={duration:.3f},"
                         f"volume={base_volume:.3f}[m];"
                         f"[v][m]amix=inputs=2:duration=longest:dropout_transition=0[out]"
@@ -475,7 +469,8 @@ class VideoMCPServer:
                 return voice_path
 
     # ─────────────────────────────────────────────────────────────────────────
-    # SFX layer (unchanged)
+    # SFX layer
+    # FIX: size=2000000000 (int) instead of size=2e+09 (float/scientific)
     # ─────────────────────────────────────────────────────────────────────────
 
     def _apply_sfx_layer(self, audio_path, output_path, duration, emotion, num_scenes):
@@ -507,8 +502,9 @@ class VideoMCPServer:
 
         if emotion in ("fear", "curiosity", "shock") and os.path.exists(rumble_path):
             inputs += ["-i", rumble_path]
+            # FIX: size=2000000000 (int) instead of size=2e+09 (float/scientific)
             filter_parts.append(
-                f"[{input_idx}:a]volume=0.08,aloop=loop=-1:size=2e+09,"
+                f"[{input_idx}:a]volume=0.08,aloop=loop=-1:size=2000000000,"
                 f"atrim=duration={duration}[rumble]"
             )
             mix_inputs.append("[rumble]")
@@ -550,7 +546,7 @@ class VideoMCPServer:
             return None
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Subtitle filter (unchanged)
+    # Subtitle filter
     # ─────────────────────────────────────────────────────────────────────────
 
     def _caption_filter(self, subtitle_path: str, output_path: str):

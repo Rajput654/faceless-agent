@@ -5,23 +5,25 @@ UPGRADED v2 with four improvements on top of v1:
 
 1. OPENING HOOK CARD (NEW)
    A 0.7-second black-background bold text card is prepended to the video.
-   This is the scroll-stop mechanism — the viewer sees the hook TEXT before
-   the voice even starts. It's what makes people stop scrolling in the feed.
-   The card uses yellow text on black, matching the caption highlight colour.
 
 2. RAPID CUT TIMING
-   seg_dur is now capped at 3.0s (was no cap, often 8-9s per scene).
-   xfade duration reduced to 0.25s (was 0.5s) for snappier cuts.
-   This matches the ~1-cut-per-3-seconds rhythm of viral Shorts.
+   seg_dur is now capped at 3.0s. xfade duration reduced to 0.25s.
 
 3. EMOTION-AWARE KEN BURNS (from v1, preserved)
-   Motion preset chosen based on emotion field.
 
-4. DYNAMIC MUSIC DUCKING (from v1, preserved)
-   Music envelope: silence during hook, sustain in body, fade before CTA.
+4. DYNAMIC MUSIC DUCKING (FIXED v3)
+   Four bugs fixed that caused music to be silently dropped:
+   BUG 1: volume_expr was wrapped in single quotes inside filter_complex string,
+          breaking ffmpeg's filter parser on Linux → filter fails → fallback → voice only.
+          FIX: commas inside the expr are escaped with \, (ffmpeg filter escaping).
+   BUG 2: amix used duration=first which truncates music to voice length, then
+          -shortest on the final compose also cut it. FIX: duration=longest + -t.
+   BUG 3: Music shorter than voice got silently dropped by duration=first.
+          FIX: aloop the music track before trimming so it always fills duration.
+   BUG 4: No diagnostic logging — failures were invisible in CI.
+          FIX: Added size checks and explicit error logging on both mix paths.
 
 5. SFX LAYER (from v1, preserved)
-   Whoosh/rumble/riser from assets/sfx/ if available.
 
 Original subtitle safe-path fix is preserved unchanged.
 """
@@ -135,7 +137,7 @@ class VideoMCPServer:
         height:        int   = 1920,
         emotion:       str   = "inspiration",
         kb_preset:     str   = None,
-        hook_text:     str   = "",      # NEW: text for opening hook card
+        hook_text:     str   = "",
         **kwargs,
     ):
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -180,16 +182,29 @@ class VideoMCPServer:
                     )
                     if merged_with_hook and os.path.exists(merged_with_hook):
                         merged = merged_with_hook
-                        # Add hook card duration to total
                         duration += 0.7
                         logger.success(f"Hook card prepended ✅ (+0.7s)")
 
-            # ── Dynamic music ducking ─────────────────────────────────────────
+            # ── Dynamic music ducking (FIXED) ─────────────────────────────────
             if music_path and os.path.exists(music_path):
+                music_size = os.path.getsize(music_path)
+                logger.info(
+                    f"Mixing music: {music_path} ({music_size // 1024} KB) "
+                    f"at volume={music_volume:.3f} over {duration:.1f}s"
+                )
                 final_audio = self._dynamic_music_mix(
                     audio_path, music_path, output_path, duration, music_volume
                 )
+                if final_audio == audio_path:
+                    logger.warning(
+                        "Music mix returned voice_path — music was NOT mixed. "
+                        "Check ffmpeg filter_complex errors above."
+                    )
             else:
+                if music_path:
+                    logger.warning(f"music_path provided but file missing: {music_path}")
+                else:
+                    logger.warning("No music_path provided — video will be voice-only")
                 final_audio = audio_path
 
             # ── SFX layer ─────────────────────────────────────────────────────
@@ -203,12 +218,15 @@ class VideoMCPServer:
             # ── Subtitle filter ───────────────────────────────────────────────
             vf_final, sub_tmp = self._caption_filter(subtitle_path, output_path)
 
+            # BUG FIX 2: removed -shortest flag — it cut audio at video length.
+            # Instead use -t with the exact duration so both streams play fully.
             compose_cmd = [
                 "ffmpeg", "-y",
                 "-i", merged, "-i", final_audio,
                 "-c:v", "libx264", "-preset", "fast", "-crf", "21",
                 "-c:a", "aac", "-b:a", "192k",
-                "-shortest", "-movflags", "+faststart",
+                "-t", str(duration),           # explicit duration, no -shortest
+                "-movflags", "+faststart",
             ]
             if vf_final:
                 compose_cmd += ["-vf", vf_final]
@@ -251,26 +269,19 @@ class VideoMCPServer:
         }
 
     # ─────────────────────────────────────────────────────────────────────────
-    # NEW: Opening hook card generation
+    # Opening hook card generation
     # ─────────────────────────────────────────────────────────────────────────
 
     def _generate_hook_card(self, hook_text: str, output_path: str,
                              width: int = 1080, height: int = 1920,
                              fps: int = 30) -> str:
-        """
-        Generate a 0.7-second bold text card on black background.
-        Yellow text, thick black border — matches caption highlight color.
-        This is the scroll-stop frame: viewers see the hook text BEFORE audio starts.
-        """
         card_path = output_path.replace(".mp4", "_hookcard.mp4")
 
-        # Clean text for drawtext (no quotes, colons, backslashes)
         import re
         clean = hook_text[:55]
         clean = re.sub(r"[':=\\\"()]", "", clean)
         clean = re.sub(r"\s+", " ", clean).strip().upper()
 
-        # Split into two lines if too long
         words = clean.split()
         if len(words) > 5:
             mid = len(words) // 2
@@ -318,7 +329,6 @@ class VideoMCPServer:
 
     def _prepend_hook_card(self, hook_card: str, main_video: str,
                             output_path: str, fps: int = 30) -> str:
-        """Concatenate hook card + main video using FFmpeg concat demuxer."""
         with_hook_path = output_path.replace(".mp4", "_with_hook.mp4")
         list_path      = output_path.replace(".mp4", "_concat_list.txt")
 
@@ -333,7 +343,7 @@ class VideoMCPServer:
                 "-i", list_path,
                 "-c:v", "libx264", "-preset", "fast", "-crf", "21",
                 "-pix_fmt", "yuv420p",
-                "-an",  # no audio — audio is added in the final compose step
+                "-an",
                 with_hook_path,
             ]
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -353,7 +363,7 @@ class VideoMCPServer:
             return None
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Dynamic music ducking (from v1, unchanged)
+    # FIXED: Dynamic music ducking
     # ─────────────────────────────────────────────────────────────────────────
 
     def _dynamic_music_mix(self, voice_path, music_path, output_path,
@@ -364,49 +374,108 @@ class VideoMCPServer:
         ramp_out_start = max(ramp_in_end + 1, duration - 5.0)
         ramp_out_end   = max(ramp_out_start + 1, duration - 1.0)
 
+        # BUG FIX 1: Commas inside ffmpeg filter expressions must be escaped
+        # with \, when the expression is part of a larger filter_complex string.
+        # The old code wrapped the expr in single quotes ('...') which is NOT
+        # valid ffmpeg filter syntax — it's a shell quoting concept that ffmpeg
+        # does not understand. This caused the entire filter_complex to fail,
+        # which silently fell back to voice-only audio.
         volume_expr = (
-            f"if(lt(t,{ramp_in_end:.1f}),"
-            f"{base_volume:.3f}*t/{ramp_in_end:.1f},"
-            f"if(lt(t,{ramp_out_start:.1f}),"
-            f"{base_volume:.3f},"
-            f"if(lt(t,{ramp_out_end:.1f}),"
+            f"if(lt(t\\,{ramp_in_end:.1f})\\,"
+            f"{base_volume:.3f}*t/{ramp_in_end:.1f}\\,"
+            f"if(lt(t\\,{ramp_out_start:.1f})\\,"
+            f"{base_volume:.3f}\\,"
+            f"if(lt(t\\,{ramp_out_end:.1f})\\,"
             f"{base_volume:.3f}*(1-(t-{ramp_out_start:.1f})"
-            f"/({ramp_out_end:.1f}-{ramp_out_start:.1f})),"
+            f"/({ramp_out_end:.1f}-{ramp_out_start:.1f}))\\,"
             f"0)))"
         )
 
+        logger.info(
+            f"Music mix attempt: voice={os.path.basename(voice_path)} "
+            f"music={os.path.basename(music_path)} "
+            f"duration={duration:.1f}s vol={base_volume:.3f}"
+        )
+
         try:
+            # BUG FIX 2: aloop the music so it always covers full duration
+            # regardless of music file length. atrim clips it to exact duration.
+            # amix duration=longest ensures neither stream cuts the other short.
+            # dropout_transition=0 prevents abrupt cutoff artefacts.
+            # -t sets the final output duration explicitly.
             self._run([
                 "ffmpeg", "-y",
-                "-i", voice_path, "-i", music_path,
+                "-i", voice_path,
+                "-i", music_path,
                 "-filter_complex",
-                (f"[0:a]volume=1.0[voice];"
-                 f"[1:a]volume='{volume_expr}'[music_ducked];"
-                 f"[voice][music_ducked]amix=inputs=2:duration=first:dropout_transition=2[out]"),
-                "-map", "[out]", "-t", str(duration),
-                "-c:a", "aac", "-b:a", "192k", mixed_path,
+                (
+                    f"[0:a]volume=1.0[voice];"
+                    f"[1:a]aloop=loop=-1:size=2e+09,"
+                    f"atrim=duration={duration:.3f},"
+                    f"volume={volume_expr}[music_ducked];"
+                    f"[voice][music_ducked]amix=inputs=2:duration=longest:dropout_transition=0[out]"
+                ),
+                "-map", "[out]",
+                "-t", str(duration),
+                "-c:a", "aac", "-b:a", "192k",
+                mixed_path,
             ], "dynamic music mix")
-            logger.success("Dynamic music mix ✅")
+
+            # BUG FIX 4: validate the output actually contains music
+            size = os.path.getsize(mixed_path) if os.path.exists(mixed_path) else 0
+            if size < 10_000:
+                raise RuntimeError(
+                    f"Mixed audio suspiciously small ({size} bytes) — "
+                    "likely only silence or a failed mix"
+                )
+
+            logger.success(f"Dynamic music mix ✅  ({size // 1024} KB, {duration:.1f}s)")
             return mixed_path
+
         except Exception as e:
-            logger.warning(f"Dynamic music mix failed ({e}), trying simple flat mix")
+            logger.warning(
+                f"Dynamic music mix failed: {e}\n"
+                f"Retrying with simple flat mix (no ducking ramp)..."
+            )
             try:
+                # BUG FIX 3: simple fallback also loops music and uses duration=longest
                 self._run([
                     "ffmpeg", "-y",
-                    "-i", voice_path, "-i", music_path,
+                    "-i", voice_path,
+                    "-i", music_path,
                     "-filter_complex",
-                    (f"[0:a]volume=1.0[v];[1:a]volume={base_volume:.3f}[m];"
-                     f"[v][m]amix=inputs=2:duration=first:dropout_transition=2[out]"),
-                    "-map", "[out]", "-t", str(duration),
-                    "-c:a", "aac", "-b:a", "192k", mixed_path,
+                    (
+                        f"[0:a]volume=1.0[v];"
+                        f"[1:a]aloop=loop=-1:size=2e+09,"
+                        f"atrim=duration={duration:.3f},"
+                        f"volume={base_volume:.3f}[m];"
+                        f"[v][m]amix=inputs=2:duration=longest:dropout_transition=0[out]"
+                    ),
+                    "-map", "[out]",
+                    "-t", str(duration),
+                    "-c:a", "aac", "-b:a", "192k",
+                    mixed_path,
                 ], "simple music mix fallback")
+
+                size = os.path.getsize(mixed_path) if os.path.exists(mixed_path) else 0
+                if size < 10_000:
+                    raise RuntimeError(f"Simple mixed audio also too small ({size} bytes)")
+
+                logger.success(f"Simple music mix fallback ✅  ({size // 1024} KB)")
                 return mixed_path
+
             except Exception as e2:
-                logger.warning(f"Simple music mix failed: {e2}")
+                logger.error(
+                    f"BOTH music mix attempts failed.\n"
+                    f"  Attempt 1: {e}\n"
+                    f"  Attempt 2: {e2}\n"
+                    f"Video will be voice-only. "
+                    f"Check ffmpeg version supports aloop and atrim filters."
+                )
                 return voice_path
 
     # ─────────────────────────────────────────────────────────────────────────
-    # SFX layer (from v1, unchanged)
+    # SFX layer (unchanged)
     # ─────────────────────────────────────────────────────────────────────────
 
     def _apply_sfx_layer(self, audio_path, output_path, duration, emotion, num_scenes):
@@ -426,7 +495,7 @@ class VideoMCPServer:
 
         if os.path.exists(whoosh_path) and num_scenes > 1:
             scene_dur = duration / num_scenes
-            for i in range(1, min(num_scenes, 6)):  # cap whooshes at 5
+            for i in range(1, min(num_scenes, 6)):
                 cut_ms = int(i * scene_dur * 1000)
                 inputs += ["-i", whoosh_path]
                 label = f"[whoosh{i}]"
@@ -481,7 +550,7 @@ class VideoMCPServer:
             return None
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Subtitle filter (unchanged from v1)
+    # Subtitle filter (unchanged)
     # ─────────────────────────────────────────────────────────────────────────
 
     def _caption_filter(self, subtitle_path: str, output_path: str):
@@ -506,25 +575,20 @@ class VideoMCPServer:
                 f"subtitles={safe_path}:"
                 f"force_style='FontName=Arial,FontSize=72,Bold=1,"
                 f"PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
-                f"Outline=6,Shadow=3,Alignment=5,"    # Updated: center-screen, heavier stroke
+                f"Outline=6,Shadow=3,Alignment=5,"
                 f"MarginV=0,MarginL=80,MarginR=80'"
             )
         return vf, safe_path
 
     # ─────────────────────────────────────────────────────────────────────────
-    # UPGRADED: Rapid cut Ken Burns for still images
+    # Rapid cut Ken Burns for still images
     # ─────────────────────────────────────────────────────────────────────────
 
     def _compose_from_images(self, images, output_path, duration, fps, width, height,
                               kb_preset: str = "slow_zoom_in"):
         n = len(images)
-
-        # ── RAPID CUT: cap each segment at 3.0 seconds ──────────────────────
-        # This enforces the viral 1-cut-per-3s rhythm regardless of scene count
         seg_dur = min(3.0, max(duration / n, 2.0))
-
-        # If seg_dur * n < duration, the crossfade chain handles the rest
-        xfade = 0.25  # was 0.5 — tighter crossfades = snappier
+        xfade = 0.25
 
         preset_list = KB_PRESETS_BY_EMOTION.get(kb_preset, KB_PRESETS_RANDOM)
 
@@ -552,15 +616,13 @@ class VideoMCPServer:
         return self._crossfade_clips(kb_clips, output_path, fps, xfade, seg_dur, duration)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # UPGRADED: Rapid cut for video clips
+    # Rapid cut for video clips
     # ─────────────────────────────────────────────────────────────────────────
 
     def _compose_from_clips(self, clips, output_path, duration, fps, width, height):
         n = len(clips)
-
-        # ── RAPID CUT: cap clips at 3.5s to force visual variety ────────────
         seg_dur = min(3.5, max(duration / n, 2.0))
-        xfade   = 0.25  # was 0.4
+        xfade   = 0.25
 
         scaled_clips = []
         for i, clip in enumerate(clips):
@@ -582,7 +644,7 @@ class VideoMCPServer:
         return self._crossfade_clips(scaled_clips, output_path, fps, xfade, seg_dur, duration)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Shared helpers (unchanged from v1 except xfade duration)
+    # Shared helpers
     # ─────────────────────────────────────────────────────────────────────────
 
     def _crossfade_clips(self, clips, output_path, fps, xfade_dur, seg_dur, total_dur):

@@ -1,6 +1,7 @@
 """
 agents/social_publisher.py
 Publishes the final video to YouTube with proper metadata.
+Always uses YouTube project A (single-channel setup).
 """
 import os
 from loguru import logger
@@ -27,9 +28,6 @@ class SocialPublisherAgent:
         if "#Shorts" not in description and "#shorts" not in description:
             description = description + "\n\n#Shorts"
 
-        # Alternate between YouTube project A and B by video index
-        project = "A" if video_index % 2 == 0 else "B"
-
         result = self.social_server.call(
             "upload_youtube",
             video_path=video_path,
@@ -39,7 +37,7 @@ class SocialPublisherAgent:
             category_id=self.yt_config.get("category_id", "22"),
             privacy=self.yt_config.get("privacy", "public"),
             made_for_kids=self.yt_config.get("made_for_kids", False),
-            project=project,
+            project="A",
         )
 
         if result.get("success"):

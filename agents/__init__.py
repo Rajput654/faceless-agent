@@ -5,6 +5,7 @@ from agents.visual_director import VisualDirectorAgent
 from agents.music_director import MusicDirectorAgent
 from agents.caption_maker import CaptionMakerAgent
 from agents.video_composer import VideoComposerAgent
+from agents.fact_overlayer import FactOverlayerAgent
 from agents.quality_reviewer import QualityReviewerAgent
 from agents.social_publisher import SocialPublisherAgent
 
@@ -16,6 +17,7 @@ __all__ = [
     "MusicDirectorAgent",
     "CaptionMakerAgent",
     "VideoComposerAgent",
+    "FactOverlayerAgent",
     "QualityReviewerAgent",
     "SocialPublisherAgent",
 ]

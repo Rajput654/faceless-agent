@@ -1,9 +1,12 @@
 """
 agents/video_composer.py
 
-UPGRADED: Forwards emotion and kb_preset from the script/visual pipeline
-into the VideoMCPServer so emotion-aware Ken Burns and dynamic music
-ducking are applied correctly.
+UPGRADED v2: Forwards emotion, kb_preset, AND hook_text to the VideoMCPServer.
+
+Key changes from v1:
+  - hook_text is now extracted from the script and forwarded to VideoMCPServer
+    so the opening hook card is generated automatically.
+  - emotion and kb_preset forwarding unchanged from v1.
 """
 import os
 from loguru import logger
@@ -26,8 +29,8 @@ class VideoComposerAgent:
         music_result:   dict,
         video_id:       str,
         output_dir:     str  = "/tmp",
-        emotion:        str  = None,   # NEW: forwarded from VideoWorkflow
-        kb_preset:      str  = None,   # NEW: forwarded from VisualDirectorAgent
+        emotion:        str  = None,
+        kb_preset:      str  = None,
         *args, **kwargs,
     ):
         logger.info(f"VideoComposerAgent composing video: {video_id}")
@@ -40,17 +43,24 @@ class VideoComposerAgent:
         )
         music_path    = music_result.get("music_path") if music_result.get("success") else None
 
-        # Resolve emotion from script if not explicitly passed
-        _emotion  = emotion  or script.get("emotion", "inspiration")
-        _kb_preset = kb_preset or None  # video_server will resolve from emotion if None
+        _emotion   = emotion  or script.get("emotion", "inspiration")
+        _kb_preset = kb_preset or None
+
+        # ── NEW: Extract hook text for opening card ────────────────────────
+        # Use the hook field from the script (already sharpened by Pass 3)
+        hook_text = script.get("hook", "")
 
         output_path = f"{output_dir}/{video_id}_final.mp4"
+
+        caption_style = caption_result.get('caption_style', 'unknown')
+        caption_pos   = caption_result.get('position', 'unknown')
 
         logger.info(
             f"Composing | emotion={_emotion} | kb_preset={_kb_preset} | "
             f"visuals={len(image_paths)} | "
-            f"captions={caption_result.get('caption_style', 'unknown')} | "
-            f"music={'yes' if music_path else 'no'}"
+            f"captions={caption_style} ({caption_pos}) | "
+            f"music={'yes' if music_path else 'no'} | "
+            f"hook_card={'yes' if hook_text else 'no'}"
         )
 
         result = self.video_server.call(
@@ -64,8 +74,9 @@ class VideoComposerAgent:
             fps           = self.video_config.get("fps", 30),
             width         = 1080,
             height        = 1920,
-            emotion       = _emotion,    # NEW
-            kb_preset     = _kb_preset,  # NEW
+            emotion       = _emotion,
+            kb_preset     = _kb_preset,
+            hook_text     = hook_text,   # NEW
         )
 
         if result.get("success"):

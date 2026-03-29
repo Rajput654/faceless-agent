@@ -1,29 +1,25 @@
 """
 agents/music_director.py
 
-FIXED v2 — Two bugs patched:
+FIXED v3 — Two bugs patched:
 
-BUG FIX A — RESULT KEY INCONSISTENCY:
-  MusicMCPServer returns {"success": True, "music_path": "..."} but this
-  agent was checking result.get("success") correctly, HOWEVER it then
-  returned its own dict with key "music_path" which the VideoComposerAgent
-  reads as music_result.get("music_path"). This was actually fine in the
-  happy path, but on failure paths the agent returned:
-    {"success": False, "music_path": None, "error": "..."}
-  and VideoComposerAgent's check was:
-    music_path = music_result.get("music_path") if music_result.get("success") else None
-  This meant a failed music fetch set music_path=None which then meant
-  _dynamic_music_mix() was never called → no music in video.
+BUG FIX A — last_silence_result REFERENCED BEFORE ASSIGNMENT:
+  In the query loop, when music_server returns source="generated_silence",
+  the code did `last_silence_result = result` then `continue`. But if ALL
+  queries returned real failures (success=False or raised exceptions before
+  reaching the silence generator), `last_silence_result` was never assigned.
+  The final fallback call at the end of the loop handles this correctly now,
+  but `last_silence_result` was also never actually used — the variable was
+  set but then ignored in favor of a fresh `music_server.call()` at the end.
+  Removed the dead variable entirely. Simplified to: try each query for real
+  music, stop on first success, then make one final guaranteed call at end.
 
-  FIX: Music is OPTIONAL. Even when all sources fail, the composer should
-  still receive the silence fallback path (from music_server's silence
-  generator). The agent now always returns success=True with whatever
-  path music_server provided (including silence).
-
-BUG FIX B — QUERY LIST TOO NARROW:
-  The original query list only tried 3-4 queries before giving up.
-  Added niche-specific extended query lists so Pixabay has more chances
-  to find a matching track before falling back to the generic tracks.
+BUG FIX B — MUSIC NEVER FETCHED (follows from music_server.py fix):
+  The MusicMCPServer previously always failed (Pixabay has no audio API,
+  CDN URLs were dead) and fell through to silence. Now that music_server.py
+  uses working incompetech.com CDN URLs, this agent will actually receive
+  real music on the first or second query attempt in most cases.
+  Extended the query list to give more chances before accepting silence.
 """
 import os
 from loguru import logger
@@ -33,50 +29,55 @@ from mcp_servers.music_server import MusicMCPServer
 NICHE_MUSIC_QUERIES = {
     "motivation": [
         "uplifting motivational background",
-        "epic cinematic inspiring",
-        "upbeat positive background music",
+        "epic inspiring background",
+        "upbeat positive background",
         "motivational corporate background",
         "inspiring background instrumental",
+        "uplifting energetic background",
     ],
     "horror": [
         "dark ambient horror",
         "suspenseful scary background",
-        "creepy atmospheric music",
+        "creepy atmospheric",
         "dark tension background",
-        "horror film score ambient",
+        "horror ambient dark",
+        "scary dark suspense",
     ],
     "reddit_story": [
         "calm storytelling background",
         "narrative background music",
-        "ambient background instrumental",
+        "calm ambient background",
         "soft piano background",
-        "documentary background music",
+        "calm background instrumental",
+        "storytelling narrative calm",
     ],
     "brainrot": [
-        "chaotic electronic background",
-        "upbeat energetic electronic",
-        "fast paced background music",
-        "energetic pop background",
-        "quirky fun background music",
+        "chaotic energetic electronic",
+        "upbeat fast background",
+        "energetic electronic background",
+        "fast upbeat background",
+        "chaotic fast electronic",
+        "energetic upbeat background",
     ],
     "finance": [
         "corporate professional background",
-        "calm business background music",
+        "calm business background",
         "professional ambient instrumental",
-        "corporate motivation background",
-        "clean minimal background music",
+        "corporate calm background",
+        "clean minimal background",
+        "professional corporate calm",
     ],
 }
 
 EMOTION_MUSIC_QUERIES = {
-    "inspiration": "uplifting inspiring background music",
-    "fear":        "dark horror ambient suspense",
-    "shock":       "dramatic tension cinematic",
-    "curiosity":   "mysterious ambient background",
-    "urgency":     "fast paced energetic background",
-    "amusement":   "fun upbeat quirky background",
-    "chaos":       "chaotic electronic energetic",
-    "dread":       "dark slow ominous background",
+    "inspiration": "uplifting inspiring background",
+    "fear":        "dark horror ambient",
+    "shock":       "dramatic tension",
+    "curiosity":   "calm mysterious background",
+    "urgency":     "fast energetic background",
+    "amusement":   "upbeat fun background",
+    "chaos":       "chaotic energetic electronic",
+    "dread":       "dark slow ambient",
 }
 
 
@@ -98,7 +99,7 @@ class MusicDirectorAgent:
         queries = []
         if emotion in EMOTION_MUSIC_QUERIES:
             queries.append(EMOTION_MUSIC_QUERIES[emotion])
-        queries.extend(NICHE_MUSIC_QUERIES.get(niche, ["background music cinematic"]))
+        queries.extend(NICHE_MUSIC_QUERIES.get(niche, ["calm background instrumental"]))
 
         # Deduplicate while preserving order
         seen = set()
@@ -108,64 +109,63 @@ class MusicDirectorAgent:
                 seen.add(q)
                 unique_queries.append(q)
 
-        logger.info(f"Music queries to try: {len(unique_queries)} | niche={niche} emotion={emotion}")
+        logger.info(f"Music queries: {len(unique_queries)} | niche={niche} emotion={emotion}")
 
+        # FIX A: Removed last_silence_result — was set but never used.
+        # Simplified loop: try each query, return immediately on real music.
         for i, query in enumerate(unique_queries):
             logger.debug(f"Music query {i+1}/{len(unique_queries)}: '{query}'")
-            result = self.music_server.call(
-                "fetch_music",
-                query=query,
-                output_path=music_path,
-                duration_seconds=duration,
-            )
+            try:
+                result = self.music_server.call(
+                    "fetch_music",
+                    query=query,
+                    output_path=music_path,
+                    duration_seconds=duration,
+                )
 
-            # BUG FIX A: music_server now ALWAYS returns success=True
-            # (with either real music, fallback, or silence).
-            # We check if we got actual music (non-silence source) and
-            # break early, otherwise keep trying queries for better music.
-            if result.get("success") and result.get("music_path"):
-                source = result.get("source", "unknown")
+                if result.get("success") and result.get("music_path"):
+                    source = result.get("source", "unknown")
 
-                # If we got real music (not silence), stop trying
-                if source not in ("generated_silence", "none"):
-                    logger.success(
-                        f"Music fetched ✅  source={source} | "
-                        f"query='{query}' | path={music_path}"
-                    )
-                    return {
-                        "success":        True,
-                        "music_path":     result["music_path"],
-                        "title":          result.get("title", query),
-                        "source":         source,
-                        "volume_reduction": self.music_config.get("volume_reduction", 0.12),
-                    }
-                else:
-                    # Got silence — store it but keep trying for real music
-                    logger.debug(f"Query '{query}' yielded silence, trying next query...")
-                    last_silence_result = result
-                    continue
+                    # Stop trying if we got real music (not the ambient fallback)
+                    if source not in ("generated_ambient", "none"):
+                        logger.success(
+                            f"Music fetched ✅  source={source} | "
+                            f"query='{query}' | path={music_path}"
+                        )
+                        return {
+                            "success":          True,
+                            "music_path":       result["music_path"],
+                            "title":            result.get("title", query),
+                            "source":           source,
+                            "volume_reduction": self.music_config.get("volume_reduction", 0.12),
+                        }
+                    else:
+                        # Got ambient fallback — keep trying for CDN music
+                        logger.debug(f"Query '{query}' returned ambient fallback, trying next...")
+                        continue
 
-        # All queries exhausted — use whatever music_server gave us last
-        # (silence or None). Music is OPTIONAL — never fail the pipeline.
+            except Exception as e:
+                logger.debug(f"Music query '{query}' raised exception: {e}")
+                continue
+
+        # All queries exhausted — make one final call to get the best
+        # available result (CDN music, ambient tone, or None for voice-only).
         logger.warning(
-            f"All {len(unique_queries)} music queries failed to find real music. "
-            f"Video will use silence or no background music."
+            f"All {len(unique_queries)} music queries failed to find CDN music. "
+            f"Using ambient fallback."
         )
-
-        # Final call to get the guaranteed silence fallback
         final_result = self.music_server.call(
             "fetch_music",
-            query=unique_queries[0],
+            query=unique_queries[0] if unique_queries else "calm background",
             output_path=music_path,
             duration_seconds=duration,
         )
 
-        # BUG FIX A: Always return success=True so VideoComposerAgent
-        # receives a valid result and can decide whether to mix or skip.
+        # Always return success=True — music is optional, never crash pipeline.
         return {
-            "success":        True,
-            "music_path":     final_result.get("music_path"),  # may be None if ffmpeg unavailable
-            "title":          "background music",
-            "source":         final_result.get("source", "none"),
+            "success":          True,
+            "music_path":       final_result.get("music_path"),  # None = voice-only
+            "title":            final_result.get("title", "background music"),
+            "source":           final_result.get("source", "none"),
             "volume_reduction": self.music_config.get("volume_reduction", 0.12),
         }

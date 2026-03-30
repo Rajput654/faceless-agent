@@ -1,24 +1,18 @@
 """
 agents/video_composer.py
 
-FIXED v2 — BUG FIX: music_path guard was too strict
+FIXED v3 — Music blocking bugs resolved:
 
-BUG: The original code read:
-    music_path = music_result.get("music_path") if music_result.get("success") else None
+BUG FIX B6 — MUSIC FILE EXISTENCE NOT VALIDATED AT USE TIME:
+  music_path could be received as a valid string that existed when
+  MusicDirectorAgent returned it, but by the time VideoComposerAgent
+  uses it (after several other pipeline steps), the file might have been
+  moved, renamed, or deleted (especially in batch mode with parallel jobs
+  sharing /tmp). Fix: validate existence immediately before passing to
+  video_server, and log clearly if the file has gone missing.
 
-This meant if MusicDirectorAgent returned success=False (which it did
-whenever all sources failed in the old code), music_path was forced to None
-even if a silence file was available. This caused _dynamic_music_mix() to
-be skipped entirely, producing videos with no background music track.
-
-FIX: Read music_path directly from the result dict. The MusicDirectorAgent
-now always returns success=True with either real music or a silence file path.
-The only valid "no music" state is when music_path is explicitly None (which
-only happens if even ffmpeg failed to generate silence). In that case we
-correctly skip mixing rather than crashing.
-
-Also added: music source logging so you can see in CI whether real music,
-fallback CDN music, or silence was used.
+ALSO: Added more detailed logging of music source/size so it's easy to
+confirm in CI whether real music or silence is being used.
 """
 import os
 from loguru import logger
@@ -54,23 +48,36 @@ class VideoComposerAgent:
             or caption_result.get("srt_path")
         )
 
-        # BUG FIX: Read music_path directly — do NOT gate on success flag.
-        # MusicDirectorAgent now always returns success=True, and music_path
-        # is None only when even the silence fallback failed (extremely rare).
-        # Old code: music_path = music_result.get("music_path") if music_result.get("success") else None
+        # BUG FIX B6 (original fix from v2): Read music_path directly —
+        # do NOT gate on success flag.
         music_path = music_result.get("music_path") if music_result else None
 
-        # Log what music source we're using so it's visible in CI
-        if music_path and os.path.exists(music_path):
-            music_source = music_result.get("source", "unknown")
-            music_size = os.path.getsize(music_path) // 1024
-            if music_source == "generated_silence":
-                logger.warning(f"Music: using silence track ({music_size} KB) — no real music found")
+        # BUG FIX B6 (new): Validate file existence AT USE TIME, not just
+        # at receipt time. In batch mode, /tmp files can be cleaned between steps.
+        if music_path:
+            if os.path.exists(music_path):
+                music_source = music_result.get("source", "unknown")
+                music_size   = os.path.getsize(music_path) // 1024
+                if music_source in ("generated_ambient", "none"):
+                    logger.warning(
+                        f"Music: synthetic ambient track ({music_size} KB) — "
+                        f"no CDN music was found. Video will have ambient background."
+                    )
+                else:
+                    logger.info(
+                        f"Music: {music_source} ({music_size} KB) → "
+                        f"will mix at volume {self.music_config.get('volume_reduction', 0.12)}"
+                    )
             else:
-                logger.info(f"Music: {music_source} ({music_size} KB) → will mix at volume {self.music_config.get('volume_reduction', 0.12)}")
+                # File disappeared between MusicDirector completing and now
+                logger.warning(
+                    f"Music file no longer exists at use time: {music_path} "
+                    f"(may have been moved or deleted between pipeline steps). "
+                    f"Video will be voice-only."
+                )
+                music_path = None
         else:
             logger.warning("Music: no track available — video will have voice only")
-            music_path = None  # ensure we don't pass a bad path to ffmpeg
 
         _emotion   = emotion  or script.get("emotion", "inspiration")
         _kb_preset = kb_preset or None

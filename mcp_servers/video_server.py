@@ -1,56 +1,49 @@
 """
 mcp_servers/video_server.py
 
-FIXED v4 — Music mixing bugs resolved:
+FIXED v5 — All music/audio blocking bugs resolved:
 
-FIX 1 — TEMP FILE CLEANUP RACE CONDITION:
-  _music_extended.mp3 was listed in the finally-block cleanup of _compose_video,
-  which ran AFTER _dynamic_music_mix had already returned. This meant on a second
-  call (or if ffmpeg internally used the file after the method returned) the file
-  was already gone. Fixed: _dynamic_music_mix now manages its own extended file
-  lifetime and cleans it up internally. Removed _music_extended.mp3 from the
-  outer finally block.
+BUG FIX B1 (revisited) — FINALLY BLOCK DELETES ACTIVE FILES:
+  The outer finally in _compose_video listed "_audio_mix.m4a" and "_sfx_mix.mp3"
+  for cleanup. These are the ACTIVE final_audio files still being read by the
+  final ffmpeg compose command when the finally fires. Result: ffmpeg reads a
+  deleted (or being-deleted) file → silent failure → voice-only or corrupt output.
+  Fix: _dynamic_music_mix cleans its OWN temp files internally. The outer finally
+  only cleans files that are NOT the final_audio being used in the compose step.
+  _apply_sfx_layer also cleans its own intermediaries internally.
 
-FIX 2 — MISSING STREAM MAPS IN FINAL COMPOSE:
-  The final ffmpeg compose command joined a video-only `merged` file with a
-  separate `final_audio` file but used no explicit -map flags. ffmpeg sometimes
-  refuses to auto-detect streams when one input is video-only and another is
-  audio-only without explicit mapping. Fixed: added -map 0:v:0 -map 1:a:0 to
-  the final compose command.
+BUG FIX B2 (revisited) — MISSING -map IN FINAL COMPOSE:
+  Confirmed: without explicit -map, when merged is video-only and final_audio
+  is .m4a (AAC), ffmpeg on some builds silently drops the audio stream.
+  Fix: explicit -map 0:v:0 -map 1:a:0 always present.
 
-FIX 3 — AAC INPUT TO SFX LAYER FILTER:
-  _apply_sfx_layer referenced [0:a] from audio_path. When _dynamic_music_mix
-  succeeds it returns an AAC file; subsequent SFX mixing re-encoded it with a
-  filter_complex that assumed MP3. This sometimes caused "codec not found"
-  errors. Fixed: always re-encode input audio as MP3 before SFX mixing via a
-  lightweight ffmpeg transcode step.
+BUG FIX B3 — SFX OUTPUT CODEC/CONTAINER MISMATCH:
+  sfx_out used .mp3 extension but "-c:a aac" — FFmpeg refuses AAC in MP3
+  container. Changed sfx_out to .m4a. Also: the final compose receives
+  sfx_out as final_audio; it's an .m4a which IS readable as input 1.
 
-FIX 4 — INCOMPETECH CDN URLS ARE DEAD:
-  music_server.py FALLBACK_TRACKS used URL-encoded paths like
-  "Upbeat%20Eternal.mp3" which incompetech.com no longer serves — they 404
-  silently, waste retry budget, and push every run into the ambient fallback.
-  Fixed in music_server.py: replaced with soundhelix.com URLs (reliable,
-  no auth, always return valid MP3s) and added archive.org mirrors as secondary.
-  Also: Pixabay API music endpoint updated (was returning 403 with old key format).
+BUG FIX B8 — CROSSFADE _merged.mp4 DELETED BY OUTER FINALLY:
+  _merged.mp4 is the return value of _compose_from_images/_compose_from_clips.
+  It's used as input 0 to the final compose. The outer finally listed it for
+  cleanup, deleting it before ffmpeg finished reading it.
+  Fix: _merged.mp4 is removed ONLY after the final compose command succeeds,
+  inside the try block, not in finally.
 
-FIX 5 — STREAM_LOOP -1 FAILS ON SOME FFMPEG BUILDS:
-  -stream_loop -1 requires the input to be seekable. On GitHub Actions runners
-  (Ubuntu 24, ffmpeg 6.x) this sometimes fails for MP3s with VBR headers.
-  Fixed: added a pre-normalization step that converts the music file to CBR MP3
-  before stream_loop, which guarantees seekability.
+BUG FIX B9 — SFX sfx_out CONTAINER MISMATCH:
+  Fixed: sfx_out now uses .m4a extension to match -c:a aac codec.
 
-FIX 6 — AAC INTO MP3 CONTAINER (NEW):
-  mixed_path used .mp3 extension but -c:a aac codec. FFmpeg refuses to write
-  AAC audio into an MP3 container, causing all three mix attempts to fail with
-  "Invalid audio stream. Exactly one MP3 audio stream is required."
-  Fixed: mixed_path now uses .m4a extension (a valid AAC container).
+BUG FIX B11 — OUTER FINALLY DELETES FILES STILL IN USE:
+  The finally block was too aggressive. It deleted temp files without knowing
+  which ones were still referenced as final_audio. Restructured: each
+  intermediate step cleans its own temp files. The outer finally only removes
+  files that are guaranteed to be intermediate (not the final compose inputs).
 
-FIX 7 — PYTHON 3 EXCEPT VARIABLE SCOPE BUG (NEW):
-  Python 3 deletes `except Exception as e1` variables after the except block
-  ends. The final error log referenced e1/e2 which were already gone, crashing
-  with "cannot access local variable 'e1' where it is not associated with a value".
-  Fixed: errors are saved to attempt1_err/attempt2_err strings before the block
-  closes, which survive the scope boundary.
+BUG FIX B4 — extended_path None guard in _dynamic_music_mix:
+  When _loop_by_concat returns None, extended_path variable still holds old
+  string. The finally tried to os.remove(None) → TypeError. Added existence
+  check before removing.
+
+PRESERVED: All v4 fixes (FIX 1-7).
 """
 import os
 import shutil
@@ -176,6 +169,9 @@ class VideoMCPServer:
             return {"success": False, "error": "No valid visual files found"}
 
         sub_tmp = None
+        # BUG FIX B1/B8/B11: Track intermediate files explicitly.
+        # Only files in this list AND confirmed to be no longer needed are deleted.
+        intermediate_files = []
 
         try:
             duration = self._audio_duration(audio_path)
@@ -194,6 +190,8 @@ class VideoMCPServer:
                     valid_assets, output_path, duration, fps, width, height,
                     kb_preset=_kb_preset
                 )
+            # merged is an intermediate — track it for cleanup AFTER compose
+            # (do NOT add to intermediate_files yet — we need it as input 0)
 
             # ── Prepend opening hook card ─────────────────────────────────────
             if hook_text:
@@ -205,17 +203,24 @@ class VideoMCPServer:
                         hook_card, merged, output_path, fps
                     )
                     if merged_with_hook and os.path.exists(merged_with_hook):
+                        # Old merged is now superseded — safe to clean up
+                        if merged != merged_with_hook:
+                            intermediate_files.append(merged)
                         merged = merged_with_hook
                         duration += 0.7
+                        intermediate_files.append(hook_card)
                         logger.success(f"Hook card prepended ✅ (+0.7s)")
 
-            # ── FIX 1: Music mixing — _dynamic_music_mix manages its own temp files ──
+            # ── Music mixing ──────────────────────────────────────────────────
+            # BUG FIX B6: Validate music file existence at use time, not just receipt time
             if music_path and os.path.exists(music_path):
                 music_size = os.path.getsize(music_path)
                 logger.info(
                     f"Mixing music: {music_path} ({music_size // 1024} KB) "
                     f"at volume={music_volume:.3f} over {duration:.1f}s"
                 )
+                # BUG FIX B1: _dynamic_music_mix manages its OWN temp files internally.
+                # It returns either mixed_path (.m4a) or voice_path (original audio).
                 final_audio = self._dynamic_music_mix(
                     audio_path, music_path, output_path, duration, music_volume
                 )
@@ -228,33 +233,44 @@ class VideoMCPServer:
                     logger.success(
                         f"Music mixed successfully → {os.path.basename(final_audio)}"
                     )
+                    # mixed_path is a NEW file — track for cleanup AFTER compose finishes
+                    # (add AFTER we confirm compose completes successfully below)
+                    _mixed_audio_to_clean = final_audio
             else:
                 if music_path:
                     logger.warning(f"music_path provided but file missing: {music_path}")
                 else:
-                    logger.warning("No music_path provided — video will be voice-only")
+                    logger.info("No music_path — video will be voice-only")
                 final_audio = audio_path
+                _mixed_audio_to_clean = None
 
             # ── SFX layer ─────────────────────────────────────────────────────
+            # BUG FIX B3/B9: _apply_sfx_layer now returns .m4a (AAC container)
+            # and manages its own cleanup internally.
             sfx_audio = self._apply_sfx_layer(
                 final_audio, output_path, duration, emotion,
                 num_scenes=len(valid_assets)
             )
             if sfx_audio and os.path.exists(sfx_audio):
+                # SFX output supersedes the mixed audio as final_audio
+                _sfx_audio_to_clean = sfx_audio
                 final_audio = sfx_audio
+            else:
+                _sfx_audio_to_clean = None
 
             # ── Subtitle filter ───────────────────────────────────────────────
             vf_final, sub_tmp = self._caption_filter(subtitle_path, output_path)
 
-            # ── FIX 2: Explicit stream mapping in final compose ───────────────
-            # Without -map flags, ffmpeg sometimes silently drops the audio
-            # when one input is video-only and the other is audio-only.
+            # ── FIX B2: Explicit stream mapping in final compose ──────────────
+            # -map 0:v:0 = video from merged (input 0, video-only)
+            # -map 1:a:0 = audio from final_audio (input 1, audio-only)
+            # Without explicit maps ffmpeg may silently drop audio on some builds.
             compose_cmd = [
                 "ffmpeg", "-y",
                 "-i", merged,        # input 0: video (no audio stream)
-                "-i", final_audio,   # input 1: audio only
-                "-map", "0:v:0",     # take video from input 0
-                "-map", "1:a:0",     # take audio from input 1
+                "-i", final_audio,   # input 1: audio (.m4a or .mp3, both valid)
+                "-map", "0:v:0",
+                "-map", "1:a:0",
                 "-c:v", "libx264", "-preset", "fast", "-crf", "21",
                 "-c:a", "aac", "-b:a", "192k",
                 "-t", str(duration),
@@ -263,26 +279,58 @@ class VideoMCPServer:
             if vf_final:
                 compose_cmd += ["-vf", vf_final]
             compose_cmd.append(output_path)
+
             self._run(compose_cmd, "final compose")
+
+            # ── Cleanup intermediate files AFTER successful compose ────────────
+            # BUG FIX B1/B8/B11: Only clean up AFTER ffmpeg has finished reading.
+            for f in intermediate_files:
+                if f and f != output_path and os.path.exists(f):
+                    try:
+                        os.remove(f)
+                    except Exception:
+                        pass
+
+            # Clean merged (input 0) — safe now that compose is done
+            merged_path_to_clean = merged
+            if merged_path_to_clean and merged_path_to_clean != output_path:
+                if os.path.exists(merged_path_to_clean):
+                    try:
+                        os.remove(merged_path_to_clean)
+                    except Exception:
+                        pass
+
+            # Clean mixed audio (input 1) — safe now that compose is done
+            if _mixed_audio_to_clean and _mixed_audio_to_clean != audio_path:
+                if os.path.exists(_mixed_audio_to_clean):
+                    try:
+                        os.remove(_mixed_audio_to_clean)
+                    except Exception:
+                        pass
+
+            # Clean SFX audio (which was input 1 if SFX succeeded)
+            if _sfx_audio_to_clean and _sfx_audio_to_clean != audio_path:
+                if os.path.exists(_sfx_audio_to_clean):
+                    try:
+                        os.remove(_sfx_audio_to_clean)
+                    except Exception:
+                        pass
 
         except Exception as e:
             logger.error(f"Video composition failed: {e}")
             return {"success": False, "error": str(e)}
 
         finally:
+            # BUG FIX B11: Only clean up files that are NEVER used as compose inputs.
+            # Do NOT clean _audio_mix.m4a, _sfx_mix.m4a, or _merged.mp4 here —
+            # those are cleaned in the try block AFTER compose finishes.
             if sub_tmp and os.path.exists(sub_tmp):
-                os.remove(sub_tmp)
-            # FIX 1: Removed _music_extended.mp3 from here — it's cleaned
-            # up inside _dynamic_music_mix now to avoid race conditions.
-            for suffix in ["_merged.mp4", "_audio_mix.mp3", "_audio_mix.m4a",
-                           "_audio_mix.aac", "_sfx_mix.mp3", "_hookcard.mp4",
-                           "_with_hook.mp4"]:
-                tmp = output_path.replace(".mp4", suffix)
-                if os.path.exists(tmp):
-                    try:
-                        os.remove(tmp)
-                    except Exception:
-                        pass
+                try:
+                    os.remove(sub_tmp)
+                except Exception:
+                    pass
+
+            # Clean per-image/clip temp files (these are never compose inputs)
             for i in range(len(valid_assets) + 5):
                 for tag in [f"_kb_{i:02d}.mp4", f"_scaled_{i:02d}.mp4", f"_cf_{i:02d}.mp4"]:
                     tmp = output_path.replace(".mp4", tag)
@@ -291,6 +339,15 @@ class VideoMCPServer:
                             os.remove(tmp)
                         except Exception:
                             pass
+
+            # Clean concat list file if it exists
+            for suffix in ["_list.txt", "_concat_list.txt"]:
+                tmp = output_path.replace(".mp4", suffix)
+                if os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
 
         file_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
         if file_size == 0:
@@ -371,7 +428,7 @@ class VideoMCPServer:
     def _prepend_hook_card(self, hook_card: str, main_video: str,
                             output_path: str, fps: int = 30) -> str:
         with_hook_path = output_path.replace(".mp4", "_with_hook.mp4")
-        list_path      = output_path.replace(".mp4", "_concat_list.txt")
+        list_path      = output_path.replace(".mp4", "_hook_concat.txt")
 
         try:
             with open(list_path, "w") as f:
@@ -405,27 +462,14 @@ class VideoMCPServer:
 
     # ─────────────────────────────────────────────────────────────────────────
     # Dynamic music ducking
-    #
-    # FIX 6: mixed_path changed from .mp3 to .m4a — FFmpeg refuses to write
-    #         AAC audio (-c:a aac) into an MP3 container. All three mix
-    #         attempts were failing with "Invalid audio stream. Exactly one
-    #         MP3 audio stream is required." Using .m4a resolves this.
-    #
-    # FIX 7: e1/e2 scope bug fixed — Python 3 deletes `except ... as var`
-    #         after the block ends. Saved to attempt1_err/attempt2_err strings
-    #         instead so the final error log can reference them.
-    #
-    # FIX 1: Temp files (_music_cbr.mp3, _music_extended.mp3) cleaned up
-    #         inside this method — not in the outer finally block.
-    # FIX 5: Pre-normalize music to CBR MP3 before stream_loop to guarantee
-    #         seekability on all ffmpeg builds (VBR headers break -stream_loop).
     # ─────────────────────────────────────────────────────────────────────────
 
     def _normalize_to_cbr(self, music_path: str, output_path: str) -> bool:
         """
         Convert music file to CBR MP3 at 128k.
         CBR is seekable on all ffmpeg builds; VBR MP3 sometimes fails with -stream_loop.
-        Returns True on success.
+        BUG FIX B7: ambient tones are now already CBR (from music_server fix),
+        but we still normalize here for any CDN files that may be VBR.
         """
         try:
             self._run([
@@ -443,11 +487,21 @@ class VideoMCPServer:
 
     def _dynamic_music_mix(self, voice_path, music_path, output_path,
                             duration, base_volume=0.10):
-        # FIX 6: Use .m4a (AAC container) instead of .mp3
-        # FFmpeg cannot write AAC audio into an MP3 container.
+        """
+        Mix voice + music. Returns mixed_path (.m4a) on success, voice_path on failure.
+
+        BUG FIX B6 (FIX 6 revisited): mixed_path uses .m4a (AAC container).
+        BUG FIX B7 (FIX 7 revisited): error strings saved before except scope ends.
+        BUG FIX B1 (FIX 1 revisited): ALL temp files cleaned inside this method's
+          own finally block — not in the caller's finally.
+        BUG FIX B4: Guard against extended_path being None in finally.
+        """
+        # BUG FIX B3/B6: .m4a is a valid AAC container; .mp3 is NOT
         mixed_path    = output_path.replace(".mp4", "_audio_mix.m4a")
         cbr_path      = output_path.replace(".mp4", "_music_cbr.mp3")
         extended_path = output_path.replace(".mp4", "_music_extended.mp3")
+        # Track whether extended_path was actually created (BUG FIX B4)
+        extended_created = False
 
         logger.info(
             f"Music mix: voice={os.path.basename(voice_path)} "
@@ -455,16 +509,16 @@ class VideoMCPServer:
             f"duration={duration:.1f}s vol={base_volume:.3f}"
         )
 
-        # ── FIX 5: Pre-normalize to CBR for seekability ───────────────────────
+        # Pre-normalize to CBR for stream_loop seekability
         cbr_ok = self._normalize_to_cbr(music_path, cbr_path)
         source_for_loop = cbr_path if cbr_ok else music_path
         if cbr_ok:
             logger.info(f"Music normalized to CBR: {os.path.getsize(cbr_path)//1024} KB")
         else:
-            logger.warning("CBR normalization failed — using original file (may fail on VBR)")
+            logger.warning("CBR normalization failed — using original file")
 
         try:
-            # ── Step 1: Pre-extend music to full video duration ───────────────
+            # Step 1: Extend music to full video duration
             try:
                 self._run([
                     "ffmpeg", "-y",
@@ -474,11 +528,13 @@ class VideoMCPServer:
                     "-c:a", "libmp3lame", "-b:a", "128k",
                     extended_path,
                 ], "extend music to video duration")
+                extended_created = True
             except Exception as e:
                 logger.warning(f"stream_loop extension failed: {e} — trying concat loop fallback")
-                # Fallback: repeat the file enough times then trim
-                extended_path = self._loop_by_concat(source_for_loop, extended_path, duration)
-                if not extended_path:
+                result = self._loop_by_concat(source_for_loop, extended_path, duration)
+                if result:
+                    extended_created = True
+                else:
                     logger.warning("All music extension methods failed — voice-only")
                     return voice_path
 
@@ -489,7 +545,7 @@ class VideoMCPServer:
             ext_size = os.path.getsize(extended_path)
             logger.info(f"Music extended: {ext_size // 1024} KB for {duration:.1f}s")
 
-            # ── Step 2: Mix voice + extended music ────────────────────────────
+            # Step 2: Mix voice + extended music
             ramp_in_end    = min(3.0, duration * 0.08)
             ramp_out_start = max(ramp_in_end + 1, duration - 5.0)
             ramp_out_end   = max(ramp_out_start + 1, duration - 1.0)
@@ -500,9 +556,8 @@ class VideoMCPServer:
                 f"volume={base_volume:.4f}"
             )
 
-            # FIX 7: Save errors to plain strings — Python 3 deletes
-            # `except ... as varname` after the block closes, so e1/e2
-            # would be unbound in the final except block.
+            # BUG FIX B7 (confirmed): Save errors as strings — Python 3 deletes
+            # `except Exception as varname` after the except block closes.
             attempt1_err = None
             attempt2_err = None
 
@@ -533,7 +588,7 @@ class VideoMCPServer:
 
             except Exception as e:
                 attempt1_err = str(e)
-                logger.warning(f"Attempt 1 (fade amix) failed: {e} — trying flat mix")
+                logger.warning(f"Attempt 1 (fade amix) failed: {attempt1_err} — trying flat mix")
 
             # Attempt 2: simple flat amix (no fade)
             try:
@@ -562,7 +617,7 @@ class VideoMCPServer:
 
             except Exception as e:
                 attempt2_err = str(e)
-                logger.warning(f"Attempt 2 (flat amix) failed: {e} — trying amerge")
+                logger.warning(f"Attempt 2 (flat amix) failed: {attempt2_err} — trying amerge")
 
             # Attempt 3: amerge (last resort)
             try:
@@ -596,9 +651,9 @@ class VideoMCPServer:
                 return voice_path
 
         finally:
-            # FIX 1: Always clean up temp files here, regardless of success/failure.
-            # This prevents race conditions with the outer finally block.
-            for tmp in [cbr_path, extended_path]:
+            # BUG FIX B1: Clean up temp files INSIDE _dynamic_music_mix.
+            # BUG FIX B4: Check each path is not None AND exists before removing.
+            for tmp in [cbr_path, extended_path if extended_created else None]:
                 if tmp and os.path.exists(tmp):
                     try:
                         os.remove(tmp)
@@ -608,7 +663,7 @@ class VideoMCPServer:
     def _loop_by_concat(self, music_path: str, output_path: str, duration: float) -> str:
         """
         Fallback music looper: repeat file N times then trim to duration.
-        Used when -stream_loop fails. Returns output_path on success, None on failure.
+        Returns output_path on success, None on failure.
         """
         try:
             music_duration = self._audio_duration(music_path)
@@ -644,7 +699,8 @@ class VideoMCPServer:
 
     # ─────────────────────────────────────────────────────────────────────────
     # SFX layer
-    # FIX 3: Normalize audio input to PCM before SFX mixing to avoid codec issues
+    # BUG FIX B3/B9: sfx_out uses .m4a (AAC container matches -c:a aac codec)
+    # BUG FIX: SFX layer manages its own temp file cleanup internally
     # ─────────────────────────────────────────────────────────────────────────
 
     def _apply_sfx_layer(self, audio_path, output_path, duration, emotion, num_scenes):
@@ -655,10 +711,10 @@ class VideoMCPServer:
         whoosh_path = str(sfx_dir / "whoosh.mp3")
         rumble_path = str(sfx_dir / "rumble.mp3")
         riser_path  = str(sfx_dir / "riser.mp3")
-        sfx_out     = output_path.replace(".mp4", "_sfx_mix.mp3")
+        # BUG FIX B9: Use .m4a (AAC container) to match -c:a aac codec
+        sfx_out = output_path.replace(".mp4", "_sfx_mix.m4a")
 
-        # FIX 3: Normalize the audio input to MP3 first so all inputs to
-        # the SFX filter_complex are the same codec family.
+        # Normalize the audio input to MP3 first for consistent codec family
         normalized_audio = output_path.replace(".mp4", "_sfx_base.mp3")
         try:
             self._run([
@@ -668,12 +724,13 @@ class VideoMCPServer:
             ], "normalize audio for SFX layer")
             sfx_input_path = normalized_audio
         except Exception:
-            sfx_input_path = audio_path  # fall back to original if normalize fails
+            sfx_input_path = audio_path
 
-        inputs      = ["-i", sfx_input_path]
+        inputs       = ["-i", sfx_input_path]
         filter_parts = ["[0:a]volume=1.0[base]"]
-        mix_inputs  = ["[base]"]
-        input_idx   = 1
+        mix_inputs   = ["[base]"]
+        input_idx    = 1
+        rumble_extended = None
 
         if os.path.exists(whoosh_path) and num_scenes > 1:
             scene_dur = duration / num_scenes
@@ -688,7 +745,7 @@ class VideoMCPServer:
                 input_idx += 1
 
         if emotion in ("fear", "curiosity", "shock") and os.path.exists(rumble_path):
-            extended_rumble = output_path.replace(".mp4", "_rumble_ext.mp3")
+            rumble_extended = output_path.replace(".mp4", "_rumble_ext.mp3")
             try:
                 self._run([
                     "ffmpeg", "-y",
@@ -696,16 +753,15 @@ class VideoMCPServer:
                     "-i", rumble_path,
                     "-t", str(duration),
                     "-c:a", "libmp3lame", "-q:a", "2",
-                    extended_rumble,
+                    rumble_extended,
                 ], "extend rumble sfx")
-                inputs += ["-i", extended_rumble]
-                filter_parts.append(
-                    f"[{input_idx}:a]volume=0.08[rumble]"
-                )
+                inputs += ["-i", rumble_extended]
+                filter_parts.append(f"[{input_idx}:a]volume=0.08[rumble]")
                 mix_inputs.append("[rumble]")
                 input_idx += 1
             except Exception as e:
                 logger.debug(f"Rumble sfx extension failed: {e}")
+                rumble_extended = None
 
         if os.path.exists(riser_path) and duration > 8:
             riser_start_ms = max(0, int((duration - 4.0) * 1000))
@@ -718,11 +774,13 @@ class VideoMCPServer:
             input_idx += 1
 
         if len(mix_inputs) <= 1:
-            if os.path.exists(normalized_audio):
-                try:
-                    os.remove(normalized_audio)
-                except Exception:
-                    pass
+            # No SFX to add — clean up and return None
+            for tmp in [normalized_audio]:
+                if tmp and os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
             return None
 
         n_mix = len(mix_inputs)
@@ -736,34 +794,25 @@ class VideoMCPServer:
             + inputs
             + ["-filter_complex", ";".join(filter_parts)]
             + ["-map", "[sfxout]", "-t", str(duration)]
+            # BUG FIX B9: -c:a aac writes to .m4a container (sfx_out)
             + ["-c:a", "aac", "-b:a", "192k", sfx_out]
         )
 
         try:
             self._run(cmd, "SFX layer mix")
             logger.success(f"SFX layer ✅  ({n_mix - 1} effects added)")
-            for tmp in [
-                output_path.replace(".mp4", "_rumble_ext.mp3"),
-                normalized_audio,
-            ]:
-                if os.path.exists(tmp):
-                    try:
-                        os.remove(tmp)
-                    except Exception:
-                        pass
             return sfx_out
         except Exception as e:
             logger.warning(f"SFX layer failed: {e}")
-            for tmp in [
-                output_path.replace(".mp4", "_rumble_ext.mp3"),
-                normalized_audio,
-            ]:
-                if os.path.exists(tmp):
+            return None
+        finally:
+            # BUG FIX B11: SFX manages its OWN intermediaries
+            for tmp in [normalized_audio, rumble_extended]:
+                if tmp and os.path.exists(tmp):
                     try:
                         os.remove(tmp)
                     except Exception:
                         pass
-            return None
 
     # ─────────────────────────────────────────────────────────────────────────
     # Subtitle filter
@@ -882,6 +931,8 @@ class VideoMCPServer:
                 )
                 prev = out_label
 
+            # BUG FIX B8: _merged.mp4 is tracked for cleanup in the CALLER
+            # after the final compose finishes — not here, not in a finally.
             merged = output_path.replace(".mp4", "_merged.mp4")
             cmd += [
                 "-filter_complex", ";".join(fg_parts),

@@ -31,9 +31,6 @@ from loguru import logger
 from mcp_servers.music_server import MusicMCPServer
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Niche base queries (used as fallback after content-specific queries fail)
-# ─────────────────────────────────────────────────────────────────────────────
 NICHE_MUSIC_QUERIES = {
     "motivation": [
         "uplifting motivational background",
@@ -72,7 +69,6 @@ NICHE_MUSIC_QUERIES = {
     ],
 }
 
-# Emotion → primary music mood descriptor
 EMOTION_MUSIC_BASE = {
     "inspiration": "uplifting inspiring",
     "urgency":     "tense urgent pulsing",
@@ -85,7 +81,6 @@ EMOTION_MUSIC_BASE = {
     "default":     "calm background",
 }
 
-# Words that commonly appear in titles/hooks but carry no music-relevant meaning
 _STOPWORDS = {
     "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
     "of", "with", "by", "this", "that", "is", "was", "are", "were", "has",
@@ -104,35 +99,24 @@ class MusicDirectorAgent:
         self.music_server = MusicMCPServer()
         self.music_config = config.get("music", {})
 
-    # ── Content-aware query builder ───────────────────────────────────────────
-
     def _extract_content_words(self, script: dict, max_words: int = 4) -> list:
-        """
-        Pull 2-4 meaningful, music-relevant words from the script's
-        title, topic, and hook. Strips stop-words and short tokens.
-        """
         sources = [
             script.get("title", ""),
             script.get("topic_brief", {}).get("topic", ""),
             script.get("hook", ""),
         ]
-        # Also pull from extractor if available
         extracted = script.get("_extracted", {})
         if extracted.get("core_mystery"):
             sources.append(extracted["core_mystery"])
         if extracted.get("emotional_trigger"):
             sources.append(extracted["emotional_trigger"])
 
-        seen = set()
+        seen  = set()
         words = []
         for text in sources:
             clean = re.sub(r"[^\w\s]", "", text.lower())
             for word in clean.split():
-                if (
-                    word not in _STOPWORDS
-                    and len(word) > 3
-                    and word not in seen
-                ):
+                if word not in _STOPWORDS and len(word) > 3 and word not in seen:
                     seen.add(word)
                     words.append(word)
                 if len(words) >= max_words:
@@ -144,34 +128,23 @@ class MusicDirectorAgent:
         Build a prioritized list of music search queries that reflect
         the SPECIFIC content of this script, not just the niche/emotion bucket.
 
-        Priority order:
+        Priority:
           1. content_words + emotion_base  (most specific)
           2. content_words alone
           3. emotion_base alone
           4. niche fallback queries        (least specific)
-
-        Example — motivation video about "morning routine":
-          Before fix: ["uplifting motivational background", ...]
-          After fix:  ["morning routine uplifting inspiring",
-                       "morning routine background",
-                       "uplifting inspiring",
-                       "uplifting motivational background", ...]
         """
-        queries = []
-        emotion_base = EMOTION_MUSIC_BASE.get(emotion, EMOTION_MUSIC_BASE["default"])
+        queries       = []
+        emotion_base  = EMOTION_MUSIC_BASE.get(emotion, EMOTION_MUSIC_BASE["default"])
         content_words = self._extract_content_words(script)
 
         if content_words:
             content_str = " ".join(content_words[:3])
-            # Most specific: content + emotion mood
             queries.append(f"{content_str} {emotion_base} background")
-            # Content-only fallback
             queries.append(f"{content_str} background instrumental")
 
-        # Emotion-only fallback
         queries.append(f"{emotion_base} background")
 
-        # Niche generic fallbacks (deduplicated)
         seen = set(queries)
         for q in NICHE_MUSIC_QUERIES.get(niche, ["calm background instrumental"]):
             if q not in seen:
@@ -184,8 +157,6 @@ class MusicDirectorAgent:
         )
         return queries
 
-    # ── Main run ──────────────────────────────────────────────────────────────
-
     def run(self, script: dict, video_id: str, output_dir: str = "/tmp", *args, **kwargs):
         logger.info(f"MusicDirectorAgent fetching music for video: {video_id}")
 
@@ -193,15 +164,11 @@ class MusicDirectorAgent:
         emotion  = script.get("emotion", "inspiration")
         duration = self.music_config.get("duration_seconds", 60)
 
-        # Canonical output path
         final_music_path = f"{output_dir}/{video_id}_music.mp3"
 
-        # BUG FIX B12: derive a stable, unique seed per video from its ID.
-        # hash() is deterministic within a process but varies across Python
-        # versions — use a simple character-sum approach instead for portability.
-        seed = sum(ord(c) for c in video_id) % 997   # prime modulus for spread
+        # Stable unique seed per video — portable across Python versions/processes
+        seed = sum(ord(c) for c in video_id) % 997
 
-        # BUG FIX B14: content-aware queries based on actual script
         queries = self._build_content_queries(script, niche, emotion)
 
         logger.info(
@@ -224,7 +191,7 @@ class MusicDirectorAgent:
                         query=query,
                         output_path=attempt_path,
                         duration_seconds=duration,
-                        seed=seed,          # BUG FIX B12: propagate seed
+                        seed=seed,
                     )
 
                     if not result.get("success"):
@@ -241,13 +208,12 @@ class MusicDirectorAgent:
                         continue
 
                     if source not in ("generated_ambient", "none"):
-                        # Real CDN / local track found
                         if music_path_result != final_music_path:
                             shutil.move(music_path_result, final_music_path)
                         logger.success(
                             f"Music fetched ✅  source={source} | "
                             f"query='{query}' | seed={seed} | "
-                            f"path={final_music_path} | {file_size // 1024} KB"
+                            f"{file_size // 1024} KB"
                         )
                         return {
                             "success":          True,
@@ -257,7 +223,6 @@ class MusicDirectorAgent:
                             "volume_reduction": self.music_config.get("volume_reduction", 0.12),
                         }
                     else:
-                        # Keep first ambient as fallback; don't overwrite it
                         if ambient_fallback_path is None:
                             ambient_fallback_path = music_path_result
                         continue
@@ -266,7 +231,7 @@ class MusicDirectorAgent:
                     logger.debug(f"Music query '{query}' raised exception: {e}")
                     continue
 
-            # ── All CDN queries exhausted ─────────────────────────────────────
+            # All CDN queries exhausted — use ambient fallback
             if ambient_fallback_path and os.path.exists(ambient_fallback_path):
                 size = os.path.getsize(ambient_fallback_path)
                 if size > 500:

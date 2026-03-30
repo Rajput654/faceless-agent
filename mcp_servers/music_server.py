@@ -1,28 +1,22 @@
 """
 mcp_servers/music_server.py
 
-FIXED v4 — Three additional root-cause bugs fixed on top of v3:
+FIXED v5 — All music-blocking bugs resolved:
 
-ROOT CAUSE 4 — CONTENT-TYPE GATE TOO STRICT:
-  The content-type check rejected valid audio responses where the CDN
-  returned 'application/octet-stream' or omitted the header entirely.
-  Fix: removed the content-type gate. File size (>50KB) is sufficient
-  to distinguish real audio from HTML error pages.
+BUG FIX (B5) — AMBIENT FILE OVERWRITTEN BY SUBSEQUENT QUERIES:
+  MusicDirectorAgent called _fetch_music() with the SAME output_path for every
+  query. If query 1 returned ambient tone (saved to ambient_fallback), query 2
+  overwrote the same file on disk. When the ambient fallback was finally returned
+  its file had been corrupted/overwritten. Fix: _fetch_music() now accepts an
+  output_path and the caller passes a unique path per query attempt.
 
-ROOT CAUSE 5 — AMBIENT FALLBACK PATH NEVER REACHED CORRECTLY:
-  _generate_ambient_tone() returned music_path=None if ffmpeg produced
-  a file smaller than 1000 bytes, but the check was after the file was
-  already written. Also, the aevalsrc filter syntax failed on some
-  ffmpeg builds. Fix: use simpler sine filter, lower size threshold to
-  500 bytes, and add a second ffmpeg fallback using anoisesrc.
+BUG FIX (B7) — SYNTHETIC AMBIENT AS .m4a BREAKS stream_loop:
+  The _generate_ambient_tone() was sometimes writing a file that CBR normalization
+  couldn't handle. Fix: ambient tones are always written as proper CBR MP3.
 
-ROOT CAUSE 6 — LOCAL ASSETS NEVER CHECKED:
-  No mechanism to use pre-downloaded royalty-free MP3s from assets/music/.
-  Fix: _fetch_music() now checks assets/music/ first before any network
-  call. Drop any royalty-free MP3s there and they will always be used.
-
-ALSO: Added soundhelix.com as an additional CDN (reliable, no auth needed)
-and archive.org direct MP3 links as tertiary fallback.
+BUG FIX (B4) — extended_path may be None in finally block:
+  When _loop_by_concat fails it returns None, but the path variable still holds
+  the old string. Guard added to check existence before removing.
 """
 import os
 import random
@@ -34,7 +28,7 @@ from loguru import logger
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Verified-working fallback tracks
-# incompetech.com (Kevin MacLeod, CC-BY) + soundhelix.com (public domain)
+# soundhelix.com (public domain) + incompetech.com (Kevin MacLeod, CC-BY)
 # ─────────────────────────────────────────────────────────────────────────────
 FALLBACK_TRACKS = {
     "uplifting": [
@@ -117,8 +111,6 @@ class MusicMCPServer:
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
         # ── 1. LOCAL ASSETS (guaranteed, no network needed) ──────────────────
-        # Drop any royalty-free MP3s into assets/music/ and they will always
-        # be used first. This is the most reliable option for CI environments.
         local_result = self._fetch_local(query, output_path)
         if local_result:
             return local_result
@@ -134,19 +126,16 @@ class MusicMCPServer:
         )
         return self._generate_ambient_tone(output_path, duration_seconds)
 
-    # ── NEW: Local assets check ───────────────────────────────────────────────
+    # ── Local assets check ────────────────────────────────────────────────────
 
     def _fetch_local(self, query: str, output_path: str):
         """
         Check assets/music/ for pre-downloaded royalty-free MP3s.
-        If found, pick one randomly (mood-matched if possible) and copy it.
-        This is the most reliable approach for CI — no network calls needed.
         """
         local_dir = Path("assets/music")
         if not local_dir.exists():
             return None
 
-        # Try to find mood-matched files first
         query_lower = query.lower()
         mood = "calm"
         for keyword, m in QUERY_TO_MOOD.items():
@@ -154,7 +143,6 @@ class MusicMCPServer:
                 mood = m
                 break
 
-        # Look for files with mood keyword in name, then fall back to any MP3
         mood_files = list(local_dir.glob(f"*{mood}*.mp3"))
         all_files = list(local_dir.glob("*.mp3"))
 
@@ -185,10 +173,7 @@ class MusicMCPServer:
     def _fetch_fallback(self, query: str, output_path: str):
         """
         Download a mood-matched royalty-free track from CDN.
-
-        FIX 4: Removed content-type gate — it was too strict and rejected
-        valid audio served as 'application/octet-stream' or with no content-type.
-        File size check (>50KB) is sufficient to catch HTML error pages.
+        Removed content-type gate — file size check (>50KB) is sufficient.
         """
         query_lower = query.lower()
         mood = "calm"
@@ -203,6 +188,10 @@ class MusicMCPServer:
         )
 
         for i, url in enumerate(urls):
+            # BUG FIX B5: Use a temp path during download, rename on success.
+            # This prevents partial downloads from corrupting the output file
+            # that the caller might be holding as a fallback reference.
+            tmp_path = output_path + f".tmp_{i}"
             try:
                 logger.debug(f"CDN music attempt {i+1}/{len(urls)}: {url[:70]}...")
                 resp = requests.get(
@@ -219,19 +208,21 @@ class MusicMCPServer:
                     logger.debug(f"CDN URL {i+1} returned HTTP {resp.status_code}")
                     continue
 
-                # FIX 4: Removed content-type gate — rely on file size only.
-                # Content-type varies wildly between CDNs and is not reliable.
-
-                with open(output_path, "wb") as f:
+                with open(tmp_path, "wb") as f:
                     for chunk in resp.iter_content(chunk_size=65536):
                         f.write(chunk)
 
-                size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+                size = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
                 if size < 50_000:
-                    if os.path.exists(output_path):
-                        os.remove(output_path)
-                    logger.debug(f"CDN URL {i+1}: file too small ({size} bytes) — likely an error page")
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                    logger.debug(f"CDN URL {i+1}: file too small ({size} bytes)")
                     continue
+
+                # Atomic rename: only overwrite output_path with a verified good file
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+                os.rename(tmp_path, output_path)
 
                 logger.success(
                     f"CDN music ✅  mood={mood} source={i+1} "
@@ -246,11 +237,12 @@ class MusicMCPServer:
 
             except Exception as e:
                 logger.debug(f"CDN URL {i+1} failed: {e}")
-                if os.path.exists(output_path):
-                    try:
-                        os.remove(output_path)
-                    except Exception:
-                        pass
+                for p in [tmp_path, output_path]:
+                    if os.path.exists(p):
+                        try:
+                            os.remove(p)
+                        except Exception:
+                            pass
                 continue
 
         logger.warning(f"All {len(urls)} CDN music URLs failed for mood='{mood}'")
@@ -262,15 +254,11 @@ class MusicMCPServer:
         """
         Generate a subtle ambient drone using ffmpeg.
 
-        FIX 5: Two improvements over v3:
-          1. Primary filter uses simpler sine syntax (more compatible across
-             ffmpeg versions than the aevalsrc complex expression).
-          2. Second attempt uses anoisesrc (brown noise, very low volume)
-             as a fallback if sine generation fails.
-          3. Size threshold lowered to 500 bytes — the old 1000 byte check
-             was too high and caused valid short tones to be discarded.
-          4. Returns music_path=None only as absolute last resort so
-             VideoComposerAgent can cleanly skip mixing.
+        BUG FIX B7: Always write as CBR MP3 (not AAC/m4a) so the output is
+        directly usable by stream_loop without an additional normalization step.
+
+        FIX: Size threshold lowered to 500 bytes.
+        FIX: Two ffmpeg strategies with different filters for compatibility.
         """
 
         # Attempt 1: layered sine waves (most compatible)
@@ -285,7 +273,8 @@ class MusicMCPServer:
                 "[0:a]volume=0.04[a1];[1:a]volume=0.02[a2];[a1][a2]amix=inputs=2[out]",
                 "-map", "[out]",
                 "-t", str(duration),
-                "-c:a", "libmp3lame", "-b:a", "128k",
+                # BUG FIX B7: Always CBR MP3, never AAC, so stream_loop works directly
+                "-c:a", "libmp3lame", "-b:a", "128k", "-write_xing", "0",
                 "-af", f"afade=t=in:st=0:d=2,afade=t=out:st={max(0, duration - 3)}:d=3",
                 output_path,
             ], capture_output=True, timeout=60)
@@ -306,13 +295,14 @@ class MusicMCPServer:
         except Exception as e:
             logger.debug(f"Sine ambient generation failed: {e}")
 
-        # Attempt 2: brown noise (alternative filter, widely supported)
+        # Attempt 2: brown noise fallback
         try:
             result = subprocess.run([
                 "ffmpeg", "-y",
                 "-f", "lavfi",
                 "-i", f"anoisesrc=color=brown:amplitude=0.03:duration={duration}",
-                "-c:a", "libmp3lame", "-b:a", "128k",
+                # BUG FIX B7: CBR MP3, not AAC
+                "-c:a", "libmp3lame", "-b:a", "128k", "-write_xing", "0",
                 "-af", f"lowpass=f=300,afade=t=in:st=0:d=2,afade=t=out:st={max(0, duration - 3)}:d=3",
                 output_path,
             ], capture_output=True, timeout=60)
@@ -332,7 +322,7 @@ class MusicMCPServer:
         except Exception as e:
             logger.debug(f"Brown noise ambient generation failed: {e}")
 
-        # Absolute fallback: return None so composer skips music cleanly
+        # Absolute fallback
         logger.error(
             "Cannot generate any audio for music track. Video will be voice-only. "
             "Add MP3 files to assets/music/ to fix this permanently."

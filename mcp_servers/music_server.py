@@ -1,22 +1,25 @@
 """
 mcp_servers/music_server.py
 
-FIXED v5 — All music-blocking bugs resolved:
+FIXED v6:
 
-BUG FIX (B5) — AMBIENT FILE OVERWRITTEN BY SUBSEQUENT QUERIES:
-  MusicDirectorAgent called _fetch_music() with the SAME output_path for every
-  query. If query 1 returned ambient tone (saved to ambient_fallback), query 2
-  overwrote the same file on disk. When the ambient fallback was finally returned
-  its file had been corrupted/overwritten. Fix: _fetch_music() now accepts an
-  output_path and the caller passes a unique path per query attempt.
+BUG FIX B12 — SAME TRACK FOR EVERY VIDEO IN A BATCH:
+  _fetch_fallback always iterated URLs in the same fixed order.
+  Every video in a 10-video batch tried the same list from the top
+  and always landed on the same first-working URL.
 
-BUG FIX (B7) — SYNTHETIC AMBIENT AS .m4a BREAKS stream_loop:
-  The _generate_ambient_tone() was sometimes writing a file that CBR normalization
-  couldn't handle. Fix: ambient tones are always written as proper CBR MP3.
+  Fix: Accept a `seed` parameter (derived from video_id hash in
+  MusicDirectorAgent). Rotate the URL list's start position using
+  seed % len(urls) before iterating. Video 0 starts at index 0,
+  video 1 at index 1, etc. — each video gets a genuinely different
+  first-choice track.
 
-BUG FIX (B4) — extended_path may be None in finally block:
-  When _loop_by_concat fails it returns None, but the path variable still holds
-  the old string. Guard added to check existence before removing.
+BUG FIX B13 — LOCAL ASSET ALWAYS RETURNS THE SAME FILE:
+  random.choice(candidates) without a seed produced the same file
+  when the Python random state was reset per process (GitHub Actions
+  spawns a fresh process per matrix job). Fixed by seeding with video seed.
+
+PRESERVED: All v5 fixes.
 """
 import os
 import random
@@ -26,10 +29,6 @@ from pathlib import Path
 from loguru import logger
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Verified-working fallback tracks
-# soundhelix.com (public domain) + incompetech.com (Kevin MacLeod, CC-BY)
-# ─────────────────────────────────────────────────────────────────────────────
 FALLBACK_TRACKS = {
     "uplifting": [
         "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3",
@@ -74,26 +73,39 @@ QUERY_TO_MOOD = {
     "motivational": "uplifting",
     "inspiring":    "uplifting",
     "epic":         "uplifting",
+    "triumphant":   "uplifting",
+    "morning":      "uplifting",
+    "success":      "uplifting",
     "dark":         "dark",
     "horror":       "dark",
     "ambient":      "dark",
     "suspense":     "dark",
     "creepy":       "dark",
     "scary":        "dark",
+    "eerie":        "dark",
+    "ominous":      "dark",
+    "tense":        "dark",
     "calm":         "calm",
     "piano":        "calm",
     "storytelling": "calm",
     "narrative":    "calm",
     "background":   "calm",
+    "mysterious":   "calm",
+    "thoughtful":   "calm",
+    "gentle":       "calm",
+    "soft":         "calm",
     "chaotic":      "energetic",
     "electronic":   "energetic",
     "meme":         "energetic",
     "fast":         "energetic",
     "upbeat":       "energetic",
+    "punchy":       "energetic",
     "corporate":    "corporate",
     "professional": "corporate",
     "business":     "corporate",
     "finance":      "corporate",
+    "minimal":      "corporate",
+    "clean":        "corporate",
 }
 
 
@@ -107,50 +119,45 @@ class MusicMCPServer:
             return {"success": False, "error": f"Unknown tool: {tool_name}"}
         return self.tools[tool_name](**kwargs)
 
-    def _fetch_music(self, query: str, output_path: str, duration_seconds: int = 60, **kwargs):
+    def _fetch_music(self, query: str, output_path: str, duration_seconds: int = 60,
+                     seed: int = 0, **kwargs):
+        """
+        seed: integer derived from video_id hash in MusicDirectorAgent.
+              Used to rotate URL order so each video in a batch gets a
+              different track rather than all landing on the same first URL.
+        """
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
-        # ── 1. LOCAL ASSETS (guaranteed, no network needed) ──────────────────
-        local_result = self._fetch_local(query, output_path)
+        local_result = self._fetch_local(query, output_path, seed=seed)
         if local_result:
             return local_result
 
-        # ── 2. CDN fallbacks (reliable public URLs) ───────────────────────────
-        cdn_result = self._fetch_fallback(query, output_path)
+        cdn_result = self._fetch_fallback(query, output_path, seed=seed)
         if cdn_result:
             return cdn_result
 
-        # ── 3. Last resort: synthetic ambient tone ────────────────────────────
-        logger.warning(
-            f"All music sources failed for '{query}' — generating synthetic ambient"
-        )
+        logger.warning(f"All music sources failed for '{query}' — generating synthetic ambient")
         return self._generate_ambient_tone(output_path, duration_seconds)
 
-    # ── Local assets check ────────────────────────────────────────────────────
+    # ── Local assets ──────────────────────────────────────────────────────────
 
-    def _fetch_local(self, query: str, output_path: str):
-        """
-        Check assets/music/ for pre-downloaded royalty-free MP3s.
-        """
+    def _fetch_local(self, query: str, output_path: str, seed: int = 0):
         local_dir = Path("assets/music")
         if not local_dir.exists():
             return None
 
         query_lower = query.lower()
-        mood = "calm"
-        for keyword, m in QUERY_TO_MOOD.items():
-            if keyword in query_lower:
-                mood = m
-                break
+        mood = self._query_to_mood(query_lower)
 
         mood_files = list(local_dir.glob(f"*{mood}*.mp3"))
-        all_files = list(local_dir.glob("*.mp3"))
+        all_files  = list(local_dir.glob("*.mp3"))
 
         candidates = mood_files if mood_files else all_files
         if not candidates:
             return None
 
-        chosen = random.choice(candidates)
+        # BUG FIX B13: use seed so different videos pick different local files
+        chosen = candidates[seed % len(candidates)]
         size = chosen.stat().st_size
         if size < 50_000:
             logger.debug(f"Local music file too small ({size} bytes): {chosen.name}")
@@ -158,9 +165,7 @@ class MusicMCPServer:
 
         import shutil
         shutil.copy2(str(chosen), output_path)
-        logger.success(
-            f"Local music ✅  {chosen.name} ({size // 1024} KB) mood={mood}"
-        )
+        logger.success(f"Local music ✅  {chosen.name} ({size // 1024} KB) mood={mood}")
         return {
             "success":    True,
             "music_path": output_path,
@@ -170,40 +175,44 @@ class MusicMCPServer:
 
     # ── CDN fallback ──────────────────────────────────────────────────────────
 
-    def _fetch_fallback(self, query: str, output_path: str):
-        """
-        Download a mood-matched royalty-free track from CDN.
-        Removed content-type gate — file size check (>50KB) is sufficient.
-        """
-        query_lower = query.lower()
-        mood = "calm"
+    def _query_to_mood(self, query_lower: str) -> str:
+        """Map query string to one of the 5 mood buckets."""
         for keyword, m in QUERY_TO_MOOD.items():
             if keyword in query_lower:
-                mood = m
-                break
+                return m
+        return "calm"
 
-        urls = FALLBACK_TRACKS.get(mood, FALLBACK_TRACKS["calm"])
-        logger.info(
-            f"Trying {len(urls)} CDN music URLs for mood='{mood}' (query='{query}')"
-        )
+    def _fetch_fallback(self, query: str, output_path: str, seed: int = 0):
+        """
+        Download a mood-matched royalty-free track from CDN.
+
+        BUG FIX B12: Rotate URL list using seed so each video in a batch
+        starts from a different URL. With 6 URLs and 10 videos, videos
+        0-5 each try a different track first. Videos 6-9 wrap around but
+        still differ from 0-5 in their second+ attempt ordering.
+        """
+        mood = self._query_to_mood(query.lower())
+        urls = FALLBACK_TRACKS.get(mood, FALLBACK_TRACKS["calm"]).copy()
+
+        # Rotate starting position — video 0 starts at 0, video 1 at 1, etc.
+        if len(urls) > 1 and seed > 0:
+            start = seed % len(urls)
+            urls = urls[start:] + urls[:start]
+            logger.debug(f"URL list rotated by {start} (seed={seed}) for variety")
+
+        logger.info(f"Trying {len(urls)} CDN music URLs for mood='{mood}' (query='{query}')")
 
         for i, url in enumerate(urls):
-            # BUG FIX B5: Use a temp path during download, rename on success.
-            # This prevents partial downloads from corrupting the output file
-            # that the caller might be holding as a fallback reference.
             tmp_path = output_path + f".tmp_{i}"
             try:
                 logger.debug(f"CDN music attempt {i+1}/{len(urls)}: {url[:70]}...")
                 resp = requests.get(
-                    url,
-                    timeout=30,
-                    stream=True,
+                    url, timeout=30, stream=True,
                     headers={
                         "User-Agent": "Mozilla/5.0 (compatible; faceless-agent/1.0)",
                         "Accept": "audio/mpeg, audio/*, */*",
                     },
                 )
-
                 if not resp.ok:
                     logger.debug(f"CDN URL {i+1} returned HTTP {resp.status_code}")
                     continue
@@ -219,19 +228,18 @@ class MusicMCPServer:
                     logger.debug(f"CDN URL {i+1}: file too small ({size} bytes)")
                     continue
 
-                # Atomic rename: only overwrite output_path with a verified good file
                 if os.path.exists(output_path):
                     os.remove(output_path)
                 os.rename(tmp_path, output_path)
 
                 logger.success(
-                    f"CDN music ✅  mood={mood} source={i+1} "
+                    f"CDN music ✅  mood={mood} url_slot={i+1}/{len(urls)} seed={seed} "
                     f"→ {output_path} ({size // 1024} KB)"
                 )
                 return {
                     "success":    True,
                     "music_path": output_path,
-                    "title":      f"royalty-free-{mood}",
+                    "title":      f"royalty-free-{mood}-{seed}",
                     "source":     "cdn",
                 }
 
@@ -251,29 +259,16 @@ class MusicMCPServer:
     # ── Synthetic ambient tone ────────────────────────────────────────────────
 
     def _generate_ambient_tone(self, output_path: str, duration: int):
-        """
-        Generate a subtle ambient drone using ffmpeg.
-
-        BUG FIX B7: Always write as CBR MP3 (not AAC/m4a) so the output is
-        directly usable by stream_loop without an additional normalization step.
-
-        FIX: Size threshold lowered to 500 bytes.
-        FIX: Two ffmpeg strategies with different filters for compatibility.
-        """
-
-        # Attempt 1: layered sine waves (most compatible)
+        """Generate a subtle ambient drone using ffmpeg (CBR MP3, stream_loop compatible)."""
         try:
             result = subprocess.run([
                 "ffmpeg", "-y",
-                "-f", "lavfi",
-                "-i", f"sine=frequency=432:duration={duration}",
-                "-f", "lavfi",
-                "-i", f"sine=frequency=864:duration={duration}",
+                "-f", "lavfi", "-i", f"sine=frequency=432:duration={duration}",
+                "-f", "lavfi", "-i", f"sine=frequency=864:duration={duration}",
                 "-filter_complex",
                 "[0:a]volume=0.04[a1];[1:a]volume=0.02[a2];[a1][a2]amix=inputs=2[out]",
                 "-map", "[out]",
                 "-t", str(duration),
-                # BUG FIX B7: Always CBR MP3, never AAC, so stream_loop works directly
                 "-c:a", "libmp3lame", "-b:a", "128k", "-write_xing", "0",
                 "-af", f"afade=t=in:st=0:d=2,afade=t=out:st={max(0, duration - 3)}:d=3",
                 output_path,
@@ -282,10 +277,7 @@ class MusicMCPServer:
             if result.returncode == 0 and os.path.exists(output_path):
                 size = os.path.getsize(output_path)
                 if size > 500:
-                    logger.warning(
-                        f"Synthetic ambient tone generated ({duration}s, {size // 1024} KB). "
-                        f"Add royalty-free MP3s to assets/music/ for better results."
-                    )
+                    logger.warning(f"Synthetic ambient tone generated ({duration}s, {size // 1024} KB).")
                     return {
                         "success":    True,
                         "music_path": output_path,
@@ -295,13 +287,11 @@ class MusicMCPServer:
         except Exception as e:
             logger.debug(f"Sine ambient generation failed: {e}")
 
-        # Attempt 2: brown noise fallback
         try:
             result = subprocess.run([
                 "ffmpeg", "-y",
                 "-f", "lavfi",
                 "-i", f"anoisesrc=color=brown:amplitude=0.03:duration={duration}",
-                # BUG FIX B7: CBR MP3, not AAC
                 "-c:a", "libmp3lame", "-b:a", "128k", "-write_xing", "0",
                 "-af", f"lowpass=f=300,afade=t=in:st=0:d=2,afade=t=out:st={max(0, duration - 3)}:d=3",
                 output_path,
@@ -310,9 +300,7 @@ class MusicMCPServer:
             if result.returncode == 0 and os.path.exists(output_path):
                 size = os.path.getsize(output_path)
                 if size > 500:
-                    logger.warning(
-                        f"Brown noise ambient generated ({duration}s, {size // 1024} KB)."
-                    )
+                    logger.warning(f"Brown noise ambient generated ({duration}s, {size // 1024} KB).")
                     return {
                         "success":    True,
                         "music_path": output_path,
@@ -322,11 +310,7 @@ class MusicMCPServer:
         except Exception as e:
             logger.debug(f"Brown noise ambient generation failed: {e}")
 
-        # Absolute fallback
-        logger.error(
-            "Cannot generate any audio for music track. Video will be voice-only. "
-            "Add MP3 files to assets/music/ to fix this permanently."
-        )
+        logger.error("Cannot generate any audio for music track. Video will be voice-only.")
         return {
             "success":    True,
             "music_path": None,

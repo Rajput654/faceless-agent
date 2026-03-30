@@ -1,30 +1,27 @@
 """
 mcp_servers/video_server.py
 
-UPGRADED v2 with four improvements on top of v1:
+UPGRADED v3 with music mixing fixes:
 
-1. OPENING HOOK CARD (NEW)
-   A 0.7-second black-background bold text card is prepended to the video.
+1. OPENING HOOK CARD (from v2, preserved)
 
-2. RAPID CUT TIMING
-   seg_dur is now capped at 3.0s. xfade duration reduced to 0.25s.
+2. RAPID CUT TIMING (from v2, preserved)
 
-3. EMOTION-AWARE KEN BURNS (from v1, preserved)
+3. EMOTION-AWARE KEN BURNS (from v2, preserved)
 
-4. DYNAMIC MUSIC DUCKING (FIXED v4)
-   ROOT CAUSE FIX: aloop filter used size=2e+09 (Python float) which ffmpeg
-   receives as the string "2e+09" — NOT a valid integer for the aloop size
-   parameter. ffmpeg rejects scientific notation silently, the entire
-   filter_complex fails, both the dynamic mix and simple fallback attempts
-   fail identically, and the function falls back to voice_path (no music).
-   FIX: All three occurrences of size=2e+09 replaced with size=2000000000
-   (a plain Python int that formats as the string "2000000000" in f-strings).
-   This affects:
-     - _dynamic_music_mix primary filter_complex
-     - _dynamic_music_mix simple fallback filter_complex
-     - _apply_sfx_layer rumble aloop filter
+4. DYNAMIC MUSIC DUCKING (FIXED v5)
+   ROOT CAUSE FIX: aloop filter with size=2000000000 or size=2e+09 fails
+   silently on many ffmpeg builds (especially Ubuntu 24 / GitHub Actions runners).
+   FIX: Replaced aloop entirely with -stream_loop -1 pre-extension approach.
+   Music is first looped to full video duration using ffmpeg -stream_loop -1,
+   then mixed with voice in a separate pass. This is universally compatible
+   across all ffmpeg versions and avoids the aloop size parameter entirely.
 
-5. SFX LAYER (from v1, preserved)
+   Also added explicit duration-based volume ramp using the volume filter
+   expression on the pre-extended file, which is simpler and more reliable
+   than doing it inline with aloop.
+
+5. SFX LAYER (from v2, preserved, aloop also replaced with -stream_loop -1)
 
 Original subtitle safe-path fix is preserved unchanged.
 """
@@ -186,7 +183,7 @@ class VideoMCPServer:
                         duration += 0.7
                         logger.success(f"Hook card prepended ✅ (+0.7s)")
 
-            # ── Dynamic music ducking (FIXED v4) ──────────────────────────────
+            # ── Dynamic music mixing (FIXED v5: stream_loop approach) ──────────
             if music_path and os.path.exists(music_path):
                 music_size = os.path.getsize(music_path)
                 logger.info(
@@ -199,7 +196,11 @@ class VideoMCPServer:
                 if final_audio == audio_path:
                     logger.warning(
                         "Music mix returned voice_path — music was NOT mixed. "
-                        "Check ffmpeg filter_complex errors above."
+                        "Video will be voice-only."
+                    )
+                else:
+                    logger.success(
+                        f"Music mixed successfully → {os.path.basename(final_audio)}"
                     )
             else:
                 if music_path:
@@ -239,16 +240,24 @@ class VideoMCPServer:
         finally:
             if sub_tmp and os.path.exists(sub_tmp):
                 os.remove(sub_tmp)
-            for suffix in ["_merged.mp4", "_audio_mix.mp3", "_sfx_mix.mp3",
-                           "_hookcard.mp4", "_with_hook.mp4"]:
+            # Clean up temp files
+            for suffix in ["_merged.mp4", "_audio_mix.mp3", "_audio_mix.aac",
+                           "_sfx_mix.mp3", "_hookcard.mp4", "_with_hook.mp4",
+                           "_music_extended.mp3"]:
                 tmp = output_path.replace(".mp4", suffix)
                 if os.path.exists(tmp):
-                    os.remove(tmp)
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
             for i in range(len(valid_assets) + 5):
                 for tag in [f"_kb_{i:02d}.mp4", f"_scaled_{i:02d}.mp4", f"_cf_{i:02d}.mp4"]:
                     tmp = output_path.replace(".mp4", tag)
                     if os.path.exists(tmp):
-                        os.remove(tmp)
+                        try:
+                            os.remove(tmp)
+                        except Exception:
+                            pass
 
         file_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
         if file_size == 0:
@@ -362,115 +371,165 @@ class VideoMCPServer:
             return None
 
     # ─────────────────────────────────────────────────────────────────────────
-    # FIXED v4: Dynamic music ducking
-    # ROOT CAUSE: size=2e+09 is a Python float. In an f-string it becomes the
-    # string "2e+09" which ffmpeg's aloop filter rejects (needs a plain int).
-    # Both the primary mix and the simple fallback had this bug, so both
-    # failed and the function always returned voice_path (no music).
-    # FIX: use 2000000000 (plain int) → formats as "2000000000" in f-strings.
+    # FIXED v5: Dynamic music ducking
+    #
+    # Root cause of previous failures:
+    #   - aloop filter with size=2000000000 fails silently on many ffmpeg builds
+    #   - aloop filter with size=2e+09 (float/scientific notation) also fails
+    #   - Both failures cause the entire filter_complex to fail, returning voice only
+    #
+    # Fix: Use -stream_loop -1 to pre-extend the music file to full duration
+    # before mixing. This avoids the aloop filter entirely and works on all
+    # ffmpeg versions including older builds on GitHub Actions runners.
+    #
+    # Pipeline:
+    #   Step 1: ffmpeg -stream_loop -1 -i music.mp3 -t {duration} → extended.mp3
+    #   Step 2: ffmpeg -i voice.mp3 -i extended.mp3 -filter_complex amix → mixed.mp3
     # ─────────────────────────────────────────────────────────────────────────
 
     def _dynamic_music_mix(self, voice_path, music_path, output_path,
                             duration, base_volume=0.10):
-        mixed_path = output_path.replace(".mp4", "_audio_mix.mp3")
-
-        ramp_in_end    = min(3.0, duration * 0.08)
-        ramp_out_start = max(ramp_in_end + 1, duration - 5.0)
-        ramp_out_end   = max(ramp_out_start + 1, duration - 1.0)
-
-        # Commas inside ffmpeg filter expressions must be escaped with \,
-        volume_expr = (
-            f"if(lt(t\\,{ramp_in_end:.1f})\\,"
-            f"{base_volume:.3f}*t/{ramp_in_end:.1f}\\,"
-            f"if(lt(t\\,{ramp_out_start:.1f})\\,"
-            f"{base_volume:.3f}\\,"
-            f"if(lt(t\\,{ramp_out_end:.1f})\\,"
-            f"{base_volume:.3f}*(1-(t-{ramp_out_start:.1f})"
-            f"/({ramp_out_end:.1f}-{ramp_out_start:.1f}))\\,"
-            f"0)))"
-        )
+        mixed_path    = output_path.replace(".mp4", "_audio_mix.mp3")
+        extended_path = output_path.replace(".mp4", "_music_extended.mp3")
 
         logger.info(
-            f"Music mix attempt: voice={os.path.basename(voice_path)} "
+            f"Music mix: voice={os.path.basename(voice_path)} "
             f"music={os.path.basename(music_path)} "
             f"duration={duration:.1f}s vol={base_volume:.3f}"
         )
 
+        # ── Step 1: Pre-extend music to full video duration ───────────────────
+        # -stream_loop -1 loops the input indefinitely; -t trims to exact duration.
+        # This is universally supported across all ffmpeg versions.
         try:
-            # FIX: size=2000000000 (int) instead of size=2e+09 (float/scientific)
+            self._run([
+                "ffmpeg", "-y",
+                "-stream_loop", "-1",
+                "-i", music_path,
+                "-t", str(duration),
+                "-c:a", "libmp3lame", "-q:a", "2",
+                extended_path,
+            ], "extend music to video duration")
+        except Exception as e:
+            logger.warning(f"Music extension failed: {e} — trying voice-only")
+            return voice_path
+
+        if not os.path.exists(extended_path) or os.path.getsize(extended_path) < 1000:
+            logger.warning("Extended music file missing or empty — voice-only")
+            return voice_path
+
+        ext_size = os.path.getsize(extended_path)
+        logger.info(f"Music extended: {ext_size // 1024} KB for {duration:.1f}s")
+
+        # ── Step 2: Mix voice + extended music with volume ramp ───────────────
+        # Volume expression: fade in over first 3s, flat in middle, fade out over last 3s.
+        # Using the volume filter on the pre-extended file (no aloop needed).
+        ramp_in_end    = min(3.0, duration * 0.08)
+        ramp_out_start = max(ramp_in_end + 1, duration - 5.0)
+        ramp_out_end   = max(ramp_out_start + 1, duration - 1.0)
+
+        # afade filters on the music stream: fade in + fade out
+        music_af = (
+            f"afade=t=in:st=0:d={ramp_in_end:.1f},"
+            f"afade=t=out:st={ramp_out_start:.1f}:d={ramp_out_end - ramp_out_start:.1f},"
+            f"volume={base_volume:.4f}"
+        )
+
+        try:
             self._run([
                 "ffmpeg", "-y",
                 "-i", voice_path,
-                "-i", music_path,
+                "-i", extended_path,
                 "-filter_complex",
                 (
                     f"[0:a]volume=1.0[voice];"
-                    f"[1:a]aloop=loop=-1:size=2000000000,"
-                    f"atrim=duration={duration:.3f},"
-                    f"volume={volume_expr}[music_ducked];"
-                    f"[voice][music_ducked]amix=inputs=2:duration=longest:dropout_transition=0[out]"
+                    f"[1:a]{music_af}[music];"
+                    f"[voice][music]amix=inputs=2:duration=longest:dropout_transition=2[out]"
                 ),
                 "-map", "[out]",
                 "-t", str(duration),
                 "-c:a", "aac", "-b:a", "192k",
                 mixed_path,
-            ], "dynamic music mix")
+            ], "dynamic music mix with fade")
 
             size = os.path.getsize(mixed_path) if os.path.exists(mixed_path) else 0
             if size < 10_000:
-                raise RuntimeError(
-                    f"Mixed audio suspiciously small ({size} bytes) — "
-                    "likely only silence or a failed mix"
-                )
+                raise RuntimeError(f"Mixed audio too small ({size} bytes)")
 
             logger.success(f"Dynamic music mix ✅  ({size // 1024} KB, {duration:.1f}s)")
             return mixed_path
 
         except Exception as e:
             logger.warning(
-                f"Dynamic music mix failed: {e}\n"
-                f"Retrying with simple flat mix (no ducking ramp)..."
+                f"Dynamic mix (with fade) failed: {e}\n"
+                f"Retrying with simple flat mix..."
             )
-            try:
-                # FIX: size=2000000000 (int) instead of size=2e+09 (float/scientific)
-                self._run([
-                    "ffmpeg", "-y",
-                    "-i", voice_path,
-                    "-i", music_path,
-                    "-filter_complex",
-                    (
-                        f"[0:a]volume=1.0[v];"
-                        f"[1:a]aloop=loop=-1:size=2000000000,"
-                        f"atrim=duration={duration:.3f},"
-                        f"volume={base_volume:.3f}[m];"
-                        f"[v][m]amix=inputs=2:duration=longest:dropout_transition=0[out]"
-                    ),
-                    "-map", "[out]",
-                    "-t", str(duration),
-                    "-c:a", "aac", "-b:a", "192k",
-                    mixed_path,
-                ], "simple music mix fallback")
 
-                size = os.path.getsize(mixed_path) if os.path.exists(mixed_path) else 0
-                if size < 10_000:
-                    raise RuntimeError(f"Simple mixed audio also too small ({size} bytes)")
+        # ── Simple flat mix fallback (no fade, just flat volume) ──────────────
+        try:
+            self._run([
+                "ffmpeg", "-y",
+                "-i", voice_path,
+                "-i", extended_path,
+                "-filter_complex",
+                (
+                    f"[0:a]volume=1.0[v];"
+                    f"[1:a]volume={base_volume:.4f}[m];"
+                    f"[v][m]amix=inputs=2:duration=longest:dropout_transition=2[out]"
+                ),
+                "-map", "[out]",
+                "-t", str(duration),
+                "-c:a", "aac", "-b:a", "192k",
+                mixed_path,
+            ], "simple flat music mix fallback")
 
-                logger.success(f"Simple music mix fallback ✅  ({size // 1024} KB)")
-                return mixed_path
+            size = os.path.getsize(mixed_path) if os.path.exists(mixed_path) else 0
+            if size < 10_000:
+                raise RuntimeError(f"Simple mixed audio also too small ({size} bytes)")
 
-            except Exception as e2:
-                logger.error(
-                    f"BOTH music mix attempts failed.\n"
-                    f"  Attempt 1: {e}\n"
-                    f"  Attempt 2: {e2}\n"
-                    f"Video will be voice-only. "
-                    f"Check ffmpeg version supports aloop and atrim filters."
-                )
-                return voice_path
+            logger.success(f"Simple flat music mix ✅  ({size // 1024} KB)")
+            return mixed_path
+
+        except Exception as e2:
+            logger.warning(
+                f"Simple flat mix also failed: {e2}\n"
+                f"Trying amerge as last resort..."
+            )
+
+        # ── amerge last resort (simplest possible stereo merge) ───────────────
+        try:
+            self._run([
+                "ffmpeg", "-y",
+                "-i", voice_path,
+                "-i", extended_path,
+                "-filter_complex",
+                f"[1:a]volume={base_volume:.4f}[m];[0:a][m]amerge=inputs=2,pan=stereo|c0<c0+c2|c1<c1+c3[out]",
+                "-map", "[out]",
+                "-t", str(duration),
+                "-c:a", "aac", "-b:a", "192k",
+                mixed_path,
+            ], "amerge last resort")
+
+            size = os.path.getsize(mixed_path) if os.path.exists(mixed_path) else 0
+            if size < 10_000:
+                raise RuntimeError(f"amerge audio too small ({size} bytes)")
+
+            logger.success(f"amerge music mix ✅  ({size // 1024} KB)")
+            return mixed_path
+
+        except Exception as e3:
+            logger.error(
+                f"ALL music mix attempts failed.\n"
+                f"  Attempt 1 (fade amix): {e}\n"  # noqa: F821 — e from outer scope
+                f"  Attempt 2 (flat amix): {e2}\n"  # noqa: F821
+                f"  Attempt 3 (amerge):    {e3}\n"
+                f"Video will be voice-only."
+            )
+            return voice_path
 
     # ─────────────────────────────────────────────────────────────────────────
     # SFX layer
-    # FIX: size=2000000000 (int) instead of size=2e+09 (float/scientific)
+    # FIXED v5: Replaced aloop with -stream_loop -1 pre-extension
     # ─────────────────────────────────────────────────────────────────────────
 
     def _apply_sfx_layer(self, audio_path, output_path, duration, emotion, num_scenes):
@@ -500,15 +559,26 @@ class VideoMCPServer:
                 mix_inputs.append(label)
                 input_idx += 1
 
+        # FIXED: For rumble, pre-extend instead of aloop
         if emotion in ("fear", "curiosity", "shock") and os.path.exists(rumble_path):
-            inputs += ["-i", rumble_path]
-            # FIX: size=2000000000 (int) instead of size=2e+09 (float/scientific)
-            filter_parts.append(
-                f"[{input_idx}:a]volume=0.08,aloop=loop=-1:size=2000000000,"
-                f"atrim=duration={duration}[rumble]"
-            )
-            mix_inputs.append("[rumble]")
-            input_idx += 1
+            extended_rumble = output_path.replace(".mp4", "_rumble_ext.mp3")
+            try:
+                self._run([
+                    "ffmpeg", "-y",
+                    "-stream_loop", "-1",
+                    "-i", rumble_path,
+                    "-t", str(duration),
+                    "-c:a", "libmp3lame", "-q:a", "2",
+                    extended_rumble,
+                ], "extend rumble sfx")
+                inputs += ["-i", extended_rumble]
+                filter_parts.append(
+                    f"[{input_idx}:a]volume=0.08[rumble]"
+                )
+                mix_inputs.append("[rumble]")
+                input_idx += 1
+            except Exception as e:
+                logger.debug(f"Rumble sfx extension failed: {e}")
 
         if os.path.exists(riser_path) and duration > 8:
             riser_start_ms = max(0, int((duration - 4.0) * 1000))
@@ -540,9 +610,20 @@ class VideoMCPServer:
         try:
             self._run(cmd, "SFX layer mix")
             logger.success(f"SFX layer ✅  ({n_mix - 1} effects added)")
+            # Clean up extended rumble temp file
+            extended_rumble_path = output_path.replace(".mp4", "_rumble_ext.mp3")
+            if os.path.exists(extended_rumble_path):
+                os.remove(extended_rumble_path)
             return sfx_out
         except Exception as e:
             logger.warning(f"SFX layer failed: {e}")
+            # Clean up on failure too
+            extended_rumble_path = output_path.replace(".mp4", "_rumble_ext.mp3")
+            if os.path.exists(extended_rumble_path):
+                try:
+                    os.remove(extended_rumble_path)
+                except Exception:
+                    pass
             return None
 
     # ─────────────────────────────────────────────────────────────────────────

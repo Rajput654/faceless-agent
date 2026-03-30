@@ -38,6 +38,19 @@ FIX 5 — STREAM_LOOP -1 FAILS ON SOME FFMPEG BUILDS:
   (Ubuntu 24, ffmpeg 6.x) this sometimes fails for MP3s with VBR headers.
   Fixed: added a pre-normalization step that converts the music file to CBR MP3
   before stream_loop, which guarantees seekability.
+
+FIX 6 — AAC INTO MP3 CONTAINER (NEW):
+  mixed_path used .mp3 extension but -c:a aac codec. FFmpeg refuses to write
+  AAC audio into an MP3 container, causing all three mix attempts to fail with
+  "Invalid audio stream. Exactly one MP3 audio stream is required."
+  Fixed: mixed_path now uses .m4a extension (a valid AAC container).
+
+FIX 7 — PYTHON 3 EXCEPT VARIABLE SCOPE BUG (NEW):
+  Python 3 deletes `except Exception as e1` variables after the except block
+  ends. The final error log referenced e1/e2 which were already gone, crashing
+  with "cannot access local variable 'e1' where it is not associated with a value".
+  Fixed: errors are saved to attempt1_err/attempt2_err strings before the block
+  closes, which survive the scope boundary.
 """
 import os
 import shutil
@@ -261,8 +274,9 @@ class VideoMCPServer:
                 os.remove(sub_tmp)
             # FIX 1: Removed _music_extended.mp3 from here — it's cleaned
             # up inside _dynamic_music_mix now to avoid race conditions.
-            for suffix in ["_merged.mp4", "_audio_mix.mp3", "_audio_mix.aac",
-                           "_sfx_mix.mp3", "_hookcard.mp4", "_with_hook.mp4"]:
+            for suffix in ["_merged.mp4", "_audio_mix.mp3", "_audio_mix.m4a",
+                           "_audio_mix.aac", "_sfx_mix.mp3", "_hookcard.mp4",
+                           "_with_hook.mp4"]:
                 tmp = output_path.replace(".mp4", suffix)
                 if os.path.exists(tmp):
                     try:
@@ -390,14 +404,21 @@ class VideoMCPServer:
             return None
 
     # ─────────────────────────────────────────────────────────────────────────
-    # FIX: Dynamic music ducking — fully reworked
+    # Dynamic music ducking
     #
-    # Changes from v3:
-    #   FIX 1: Temp file (_music_extended.mp3) is managed and cleaned up
-    #           INSIDE this method — not in the outer finally block.
-    #   FIX 5: Pre-normalize music to CBR MP3 before stream_loop to guarantee
-    #           seekability on all ffmpeg builds (VBR headers break -stream_loop).
-    #   FIX 2: All three mixing attempts use explicit -map flags.
+    # FIX 6: mixed_path changed from .mp3 to .m4a — FFmpeg refuses to write
+    #         AAC audio (-c:a aac) into an MP3 container. All three mix
+    #         attempts were failing with "Invalid audio stream. Exactly one
+    #         MP3 audio stream is required." Using .m4a resolves this.
+    #
+    # FIX 7: e1/e2 scope bug fixed — Python 3 deletes `except ... as var`
+    #         after the block ends. Saved to attempt1_err/attempt2_err strings
+    #         instead so the final error log can reference them.
+    #
+    # FIX 1: Temp files (_music_cbr.mp3, _music_extended.mp3) cleaned up
+    #         inside this method — not in the outer finally block.
+    # FIX 5: Pre-normalize music to CBR MP3 before stream_loop to guarantee
+    #         seekability on all ffmpeg builds (VBR headers break -stream_loop).
     # ─────────────────────────────────────────────────────────────────────────
 
     def _normalize_to_cbr(self, music_path: str, output_path: str) -> bool:
@@ -422,7 +443,9 @@ class VideoMCPServer:
 
     def _dynamic_music_mix(self, voice_path, music_path, output_path,
                             duration, base_volume=0.10):
-        mixed_path    = output_path.replace(".mp4", "_audio_mix.mp3")
+        # FIX 6: Use .m4a (AAC container) instead of .mp3
+        # FFmpeg cannot write AAC audio into an MP3 container.
+        mixed_path    = output_path.replace(".mp4", "_audio_mix.m4a")
         cbr_path      = output_path.replace(".mp4", "_music_cbr.mp3")
         extended_path = output_path.replace(".mp4", "_music_extended.mp3")
 
@@ -477,6 +500,12 @@ class VideoMCPServer:
                 f"volume={base_volume:.4f}"
             )
 
+            # FIX 7: Save errors to plain strings — Python 3 deletes
+            # `except ... as varname` after the block closes, so e1/e2
+            # would be unbound in the final except block.
+            attempt1_err = None
+            attempt2_err = None
+
             # Attempt 1: amix with fade
             try:
                 self._run([
@@ -502,8 +531,9 @@ class VideoMCPServer:
                 logger.success(f"Dynamic music mix ✅  ({size // 1024} KB, {duration:.1f}s)")
                 return mixed_path
 
-            except Exception as e1:
-                logger.warning(f"Attempt 1 (fade amix) failed: {e1} — trying flat mix")
+            except Exception as e:
+                attempt1_err = str(e)
+                logger.warning(f"Attempt 1 (fade amix) failed: {e} — trying flat mix")
 
             # Attempt 2: simple flat amix (no fade)
             try:
@@ -530,8 +560,9 @@ class VideoMCPServer:
                 logger.success(f"Simple flat music mix ✅  ({size // 1024} KB)")
                 return mixed_path
 
-            except Exception as e2:
-                logger.warning(f"Attempt 2 (flat amix) failed: {e2} — trying amerge")
+            except Exception as e:
+                attempt2_err = str(e)
+                logger.warning(f"Attempt 2 (flat amix) failed: {e} — trying amerge")
 
             # Attempt 3: amerge (last resort)
             try:
@@ -554,12 +585,12 @@ class VideoMCPServer:
                 logger.success(f"amerge music mix ✅  ({size // 1024} KB)")
                 return mixed_path
 
-            except Exception as e3:
+            except Exception as e:
                 logger.error(
                     f"ALL music mix attempts failed:\n"
-                    f"  Attempt 1 (fade amix): {e1}\n"
-                    f"  Attempt 2 (flat amix): {e2}\n"
-                    f"  Attempt 3 (amerge):    {e3}\n"
+                    f"  Attempt 1 (fade amix): {attempt1_err}\n"
+                    f"  Attempt 2 (flat amix): {attempt2_err}\n"
+                    f"  Attempt 3 (amerge):    {e}\n"
                     f"Video will be voice-only."
                 )
                 return voice_path

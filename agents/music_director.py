@@ -1,29 +1,25 @@
 """
 agents/music_director.py
 
-FIXED v4 — Two critical bugs patched:
+FIXED v5 — All music-blocking bugs resolved:
 
-BUG FIX A — AMBIENT FALLBACK DISCARDED (loop logic):
-  Previous code used `continue` when source == "generated_ambient", meaning
-  the ambient tone returned by music_server was thrown away and the loop kept
-  retrying. After all queries exhausted, the final fallback call ALSO returned
-  ambient — but by then the file from a previous attempt may have been
-  overwritten, and the result was still not guaranteed to reach the caller.
+BUG FIX B5/B10 — AMBIENT FILE OVERWRITTEN BY SUBSEQUENT QUERIES:
+  Every query iteration called music_server with the SAME output_path.
+  If query 1 returned an ambient tone (stored in ambient_fallback dict),
+  query 2 then overwrote that exact file on disk. When the loop finished
+  and ambient_fallback was returned, its file no longer existed or was
+  corrupted by a partial download from a later attempt.
 
-  Fix: The loop now stores the first ambient result it receives in
-  `ambient_fallback`. Real CDN music causes an immediate return. After all
-  queries are exhausted, `ambient_fallback` is returned if available. This
-  ensures ambient audio is ALWAYS returned as long as ffmpeg works.
+  Fix: Each query attempt uses a UNIQUE temp path (_attempt_{i}.mp3).
+  When a real CDN track is found, it's moved to the canonical output_path.
+  The ambient fallback temp file is moved to the canonical path only at
+  the very end, after all CDN attempts have finished.
 
-BUG FIX B — MUSIC_PATH=NONE CRASHED PIPELINE SILENTLY:
-  If both CDN and ambient generation failed (music_path=None), the returned
-  dict had success=True but music_path=None. VideoComposerAgent handled this
-  correctly, but the log made it look like music was fetched. Added explicit
-  warning logging when returning None so it's visible in CI.
-
-ALSO: Extended query list to give more CDN attempts before accepting ambient.
+BUG FIX B10 — SAME PATH FOR ALL RETRIES:
+  Related to above — unique paths per attempt prevent any cross-contamination.
 """
 import os
+import shutil
 from loguru import logger
 from mcp_servers.music_server import MusicMCPServer
 
@@ -92,10 +88,11 @@ class MusicDirectorAgent:
     def run(self, script: dict, video_id: str, output_dir: str = "/tmp", *args, **kwargs):
         logger.info(f"MusicDirectorAgent fetching music for video: {video_id}")
 
-        niche   = os.environ.get("NICHE", self.config.get("video", {}).get("niche", "motivation"))
-        emotion = script.get("emotion", "inspiration")
-        music_path = f"{output_dir}/{video_id}_music.mp3"
-        duration   = self.music_config.get("duration_seconds", 60)
+        niche    = os.environ.get("NICHE", self.config.get("video", {}).get("niche", "motivation"))
+        emotion  = script.get("emotion", "inspiration")
+        # Canonical output path — only written when we have a confirmed good file
+        final_music_path = f"{output_dir}/{video_id}_music.mp3"
+        duration = self.music_config.get("duration_seconds", 60)
 
         # Build prioritized query list
         queries = []
@@ -103,7 +100,7 @@ class MusicDirectorAgent:
             queries.append(EMOTION_MUSIC_QUERIES[emotion])
         queries.extend(NICHE_MUSIC_QUERIES.get(niche, ["calm background instrumental"]))
 
-        # Deduplicate while preserving order
+        # Deduplicate
         seen = set()
         unique_queries = []
         for q in queries:
@@ -115,107 +112,132 @@ class MusicDirectorAgent:
             f"Music queries: {len(unique_queries)} | niche={niche} emotion={emotion}"
         )
 
-        # FIX A: Store the first ambient result instead of discarding it.
-        # Real CDN music → return immediately.
-        # Ambient tone → save it and keep trying for real music.
-        # After loop exhausted → return ambient if we have it.
-        ambient_fallback = None
+        # BUG FIX B5/B10: Use UNIQUE temp path per attempt so they never overwrite each other.
+        # ambient_fallback_path tracks the first ambient file written so we can use it
+        # at the end if no CDN music was found — and it won't have been overwritten.
+        ambient_fallback_path = None
+        attempt_temp_paths = []  # track all temp files for cleanup
 
-        for i, query in enumerate(unique_queries):
-            logger.debug(f"Music query {i+1}/{len(unique_queries)}: '{query}'")
-            try:
-                result = self.music_server.call(
-                    "fetch_music",
-                    query=query,
-                    output_path=music_path,
-                    duration_seconds=duration,
-                )
+        try:
+            for i, query in enumerate(unique_queries):
+                # Each attempt gets its own isolated temp file
+                attempt_path = f"{output_dir}/{video_id}_music_attempt_{i}.mp3"
+                attempt_temp_paths.append(attempt_path)
 
-                if not result.get("success"):
+                logger.debug(f"Music query {i+1}/{len(unique_queries)}: '{query}'")
+                try:
+                    result = self.music_server.call(
+                        "fetch_music",
+                        query=query,
+                        output_path=attempt_path,   # BUG FIX: unique per attempt
+                        duration_seconds=duration,
+                    )
+
+                    if not result.get("success"):
+                        continue
+
+                    music_path_result = result.get("music_path")
+                    source = result.get("source", "unknown")
+
+                    if not music_path_result or not os.path.exists(music_path_result):
+                        logger.debug(f"Query '{query}' returned missing music_path")
+                        continue
+
+                    file_size = os.path.getsize(music_path_result)
+                    if file_size < 10_000:
+                        logger.debug(f"Query '{query}' returned tiny file ({file_size} bytes)")
+                        continue
+
+                    if source not in ("generated_ambient", "none"):
+                        # Got real CDN or local music — move to final path and return
+                        if music_path_result != final_music_path:
+                            shutil.move(music_path_result, final_music_path)
+                        logger.success(
+                            f"Music fetched ✅  source={source} | "
+                            f"query='{query}' | path={final_music_path} | {file_size//1024} KB"
+                        )
+                        return {
+                            "success":          True,
+                            "music_path":       final_music_path,
+                            "title":            result.get("title", query),
+                            "source":           source,
+                            "volume_reduction": self.music_config.get("volume_reduction", 0.12),
+                        }
+                    else:
+                        # BUG FIX B5: Save the FIRST ambient result's UNIQUE path.
+                        # It won't be overwritten because subsequent attempts use different paths.
+                        if ambient_fallback_path is None:
+                            ambient_fallback_path = music_path_result
+                            logger.debug(
+                                f"Ambient tone saved as fallback at unique path: "
+                                f"{ambient_fallback_path} ({file_size//1024} KB). "
+                                f"Continuing CDN search..."
+                            )
+                        continue
+
+                except Exception as e:
+                    logger.debug(f"Music query '{query}' raised exception: {e}")
                     continue
 
-                music_path_result = result.get("music_path")
-                source = result.get("source", "unknown")
+            # ── All CDN queries exhausted ─────────────────────────────────────
 
-                if not music_path_result:
-                    # music_path=None means even ambient failed — keep trying
-                    logger.debug(f"Query '{query}' returned music_path=None")
-                    continue
-
-                if source not in ("generated_ambient", "none"):
-                    # Got real CDN or local music — return immediately
-                    logger.success(
-                        f"Music fetched ✅  source={source} | "
-                        f"query='{query}' | path={music_path_result}"
+            # BUG FIX B5: ambient_fallback_path is a unique file, not overwritten
+            if ambient_fallback_path and os.path.exists(ambient_fallback_path):
+                size = os.path.getsize(ambient_fallback_path)
+                if size > 500:
+                    # Move the ambient file to the canonical final path
+                    if ambient_fallback_path != final_music_path:
+                        shutil.move(ambient_fallback_path, final_music_path)
+                        ambient_fallback_path = final_music_path
+                    logger.warning(
+                        f"No CDN music found after {len(unique_queries)} queries. "
+                        f"Using synthetic ambient tone ({size//1024} KB) as background music."
                     )
                     return {
                         "success":          True,
-                        "music_path":       music_path_result,
-                        "title":            result.get("title", query),
-                        "source":           source,
+                        "music_path":       final_music_path,
+                        "title":            "ambient",
+                        "source":           "generated_ambient",
                         "volume_reduction": self.music_config.get("volume_reduction", 0.12),
                     }
-                else:
-                    # FIX A: Got ambient fallback — save it, keep trying for real music
-                    if ambient_fallback is None:
-                        ambient_fallback = result
-                        logger.debug(
-                            f"Ambient tone saved as fallback (source={source}). "
-                            f"Continuing to search for CDN music..."
-                        )
-                    continue
 
-            except Exception as e:
-                logger.debug(f"Music query '{query}' raised exception: {e}")
-                continue
-
-        # ── All CDN queries exhausted ─────────────────────────────────────────
-
-        # FIX A: Return the stored ambient fallback if we have one
-        if ambient_fallback and ambient_fallback.get("music_path"):
+            # No ambient was stored — make one final guaranteed attempt directly to final path
             logger.warning(
-                f"No CDN music found after {len(unique_queries)} queries. "
-                f"Using synthetic ambient tone as background music."
+                f"All {len(unique_queries)} music queries failed with no ambient stored. "
+                f"Making final ambient generation attempt directly to canonical path."
             )
+            final_result = self.music_server.call(
+                "fetch_music",
+                query=unique_queries[0] if unique_queries else "calm background",
+                output_path=final_music_path,
+                duration_seconds=duration,
+            )
+
+            final_music = final_result.get("music_path")
+
+            if not final_music or not os.path.exists(final_music):
+                logger.warning(
+                    "Music generation completely failed. Video will be voice-only. "
+                    "To fix: add MP3 files to assets/music/ or check ffmpeg installation."
+                )
+                final_music = None
+
             return {
                 "success":          True,
-                "music_path":       ambient_fallback["music_path"],
-                "title":            ambient_fallback.get("title", "ambient"),
-                "source":           ambient_fallback.get("source", "generated_ambient"),
+                "music_path":       final_music,
+                "title":            final_result.get("title", "background music"),
+                "source":           final_result.get("source", "none"),
                 "volume_reduction": self.music_config.get("volume_reduction", 0.12),
             }
 
-        # No ambient was stored — make one final guaranteed attempt
-        logger.warning(
-            f"All {len(unique_queries)} music queries failed with no ambient stored. "
-            f"Making final ambient generation attempt."
-        )
-        final_result = self.music_server.call(
-            "fetch_music",
-            query=unique_queries[0] if unique_queries else "calm background",
-            output_path=music_path,
-            duration_seconds=duration,
-        )
-
-        final_music_path = final_result.get("music_path")
-
-        # FIX B: Explicit warning when returning None so it's visible in CI
-        if not final_music_path:
-            logger.warning(
-                "Music generation completely failed. Video will be voice-only. "
-                "To fix: add MP3 files to assets/music/ or check ffmpeg installation."
-            )
-        else:
-            logger.info(
-                f"Final music fallback: source={final_result.get('source')} | "
-                f"path={final_music_path}"
-            )
-
-        # Always return success=True — music is optional, never crash the pipeline
-        return {
-            "success":          True,
-            "music_path":       final_music_path,
-            "title":            final_result.get("title", "background music"),
-            "source":           final_result.get("source", "none"),
-            "volume_reduction": self.music_config.get("volume_reduction", 0.12),
-        }
+        finally:
+            # Clean up all attempt temp files EXCEPT the one that became our result
+            for tmp_path in attempt_temp_paths:
+                if (tmp_path
+                        and tmp_path != final_music_path
+                        and tmp_path != ambient_fallback_path
+                        and os.path.exists(tmp_path)):
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass

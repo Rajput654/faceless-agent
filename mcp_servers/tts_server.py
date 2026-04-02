@@ -1,27 +1,21 @@
 """
 mcp_servers/tts_server.py
 
-FIXED v3:
-  BUG FIX 1 — ROBOTIC VOICE:
-    - edge-tts rate reduced from +25% (brainrot) to more natural levels
-    - Added SSML-style pauses via text preprocessing (commas, ellipsis, em-dash)
-    - _build_srt() now uses non-uniform timing — longer words get more time
-    - Added sentence-boundary pauses in SRT generation
-    - Kokoro speed capped: was 1.3 (brainrot) → 1.1 max
-    - edge-tts volume boosted to avoid muddy mixing with music
+FIXED v4:
+  BUG FIX 4 — ASYNCIO DEPRECATION / CRASH ON PYTHON 3.10+/3.12+:
+    asyncio.get_event_loop() is deprecated in Python 3.10 and raises
+    RuntimeError on Python 3.12+ when there is no current running event loop
+    (which is the normal case in a non-async context like a GitHub Actions runner).
+    The previous try/except caught RuntimeError and fell back to asyncio.run(),
+    so it "partially worked" on 3.10-3.11 but with deprecation warnings.
+    On Python 3.12 the get_event_loop() call itself could fail before the
+    try body even runs.
 
-  BUG FIX 2 — INCOMPLETE STORY:
-    - Added _chunk_long_text() to split scripts >400 chars into sentences
-      before passing to TTS. edge-tts and Kokoro can silently truncate
-      very long inputs; chunking + concatenation prevents this.
-    - Each chunk is generated separately then joined via ffmpeg concat.
-    - Fallback SRT is now rebuilt from the full text after concat.
+    Fix: _edge_generate now always uses asyncio.run() as the primary path,
+    with a nest_asyncio fallback for the rare case where a running loop exists
+    (e.g. Jupyter notebooks or async test runners).
 
-TTS Backend Priority (unchanged):
-  1. Chatterbox TTS  — near-human, MIT license
-  2. Kokoro ONNX     — fast, Apache 2.0
-  3. edge-tts        — Microsoft Neural voices
-  4. gTTS            — robotic last resort only
+PRESERVED: All v3 fixes (BUG FIX 1 robotic voice, BUG FIX 2 incomplete story).
 """
 import os
 import re
@@ -122,7 +116,7 @@ def _download_kokoro_models() -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIX 1: More natural voice config — reduced rates, natural prosody
+# Voice config
 # ─────────────────────────────────────────────────────────────────────────────
 
 CHATTERBOX_NICHE_CONFIG = {
@@ -135,11 +129,11 @@ CHATTERBOX_NICHE_CONFIG = {
 }
 
 KOKORO_VOICE_MAP = {
-    "motivation":   ("am_michael", 1.0),   # FIX: was 1.1 — slightly fast, caused robotic clip
-    "horror":       ("am_adam",    0.85),  # FIX: was 0.88 — slower = more ominous
-    "reddit_story": ("af_sky",     0.95),  # FIX: was 1.0 — slightly slower = more natural
-    "brainrot":     ("af_bella",   1.1),   # FIX: was 1.3 — too fast = unintelligible
-    "finance":      ("bm_george",  1.0),   # FIX: was 1.05 — natural pace
+    "motivation":   ("am_michael", 1.0),
+    "horror":       ("am_adam",    0.85),
+    "reddit_story": ("af_sky",     0.95),
+    "brainrot":     ("af_bella",   1.1),
+    "finance":      ("bm_george",  1.0),
     "default":      ("am_michael", 1.0),
 }
 
@@ -150,109 +144,57 @@ KOKORO_VOICES = [
     "bm_george","bm_lewis",
 ]
 
-# FIX 1: Reduced edge-tts rates — previous values caused robotic clipping
-# The higher the rate, the less natural prosody edge-tts can maintain.
-# Brainrot was +25% — that's basically speed-run territory. Capped at +15%.
 EDGE_VOICE_MAP = {
-    "motivation":   ("en-US-GuyNeural",   "+8%"),    # FIX: was +15%
-    "horror":       ("en-US-DavisNeural", "-8%"),    # FIX: was -5% — slower = creepier
-    "reddit_story": ("en-US-AriaNeural",  "+3%"),    # FIX: was +5%
-    "brainrot":     ("en-US-JennyNeural", "+15%"),   # FIX: was +25% — too fast = robotic
-    "finance":      ("en-GB-RyanNeural",  "+5%"),    # FIX: was +10%
-    "default":      ("en-US-GuyNeural",   "+5%"),    # FIX: was +10%
+    "motivation":   ("en-US-GuyNeural",   "+8%"),
+    "horror":       ("en-US-DavisNeural", "-8%"),
+    "reddit_story": ("en-US-AriaNeural",  "+3%"),
+    "brainrot":     ("en-US-JennyNeural", "+15%"),
+    "finance":      ("en-GB-RyanNeural",  "+5%"),
+    "default":      ("en-US-GuyNeural",   "+5%"),
 }
 
-# FIX 1: Natural pitch and volume — previous settings were flat
 EDGE_PITCH_MAP = {
     "motivation":   "+2Hz",
-    "horror":       "-5Hz",    # slightly lower = menacing
+    "horror":       "-5Hz",
     "reddit_story": "+0Hz",
     "brainrot":     "+3Hz",
-    "finance":      "-2Hz",    # slightly lower = authoritative
+    "finance":      "-2Hz",
     "default":      "+0Hz",
 }
 
-# FIX 2: Max chars before chunking — edge-tts silently truncates beyond ~800 chars
 TTS_CHUNK_SIZE = 600
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIX 1: Text preprocessing — add natural prosody cues
+# Text preprocessing
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _preprocess_for_natural_speech(text: str) -> str:
-    """
-    Transform script text so edge-tts produces more natural prosody.
-
-    Key transforms:
-    - Ellipsis (...) → pause marker that edge-tts respects
-    - Em-dash sequences → comma pause  
-    - All-caps words → spaced letters (edge-tts reads them naturally)
-    - Numbers → spelled out in ways that sound less robotic
-    - Short 1-3 word sentences → kept short (already natural)
-    - Add slight pause after each sentence for breathing room
-    """
-    # Normalize whitespace
     text = re.sub(r'\s+', ' ', text).strip()
-
-    # Em-dash → comma (TTS handles commas as natural pause)
     text = re.sub(r'\s*—\s*', ', ', text)
     text = re.sub(r'\s*–\s*', ', ', text)
-
-    # Ellipsis already adds natural pause in edge-tts — preserve it
-    # But normalize multiple dots
     text = re.sub(r'\.{4,}', '...', text)
-
-    # Ensure sentences end with period for proper pause
-    # (some scripts use newlines as sentence separators)
     text = re.sub(r'\n+', '. ', text)
-    text = re.sub(r'\.\s*\.', '.', text)  # double-period cleanup
+    text = re.sub(r'\.\s*\.', '.', text)
     text = re.sub(r'\s+', ' ', text).strip()
-
-    # Add a breath pause after very short punchy sentences (under 5 words)
-    # by inserting a comma before the next sentence
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    processed = []
-    for i, sentence in enumerate(sentences):
-        word_count = len(sentence.split())
-        processed.append(sentence)
-        # Short sentence followed by another short sentence = add breathing room
-        if word_count <= 4 and i < len(sentences) - 1:
-            next_wc = len(sentences[i+1].split())
-            if next_wc <= 4:
-                # Don't modify — the period already handles pause
-                pass
-
-    return ' '.join(processed)
+    return text
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIX 2: Text chunking — prevents silent truncation in TTS backends
+# Text chunking
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _chunk_text(text: str, max_chars: int = TTS_CHUNK_SIZE) -> list:
-    """
-    Split long text into sentence-boundary chunks under max_chars.
-
-    This prevents edge-tts and Kokoro from silently truncating long scripts,
-    which was the root cause of "incomplete story" in generated videos.
-
-    Returns a list of text chunks. Each chunk ends at a sentence boundary.
-    """
     if len(text) <= max_chars:
         return [text]
 
-    # Split on sentence boundaries
     sentences = re.split(r'(?<=[.!?])\s+', text)
-
     chunks = []
     current_chunk = ""
 
     for sentence in sentences:
         if not sentence.strip():
             continue
-
-        # If adding this sentence would exceed limit, flush current chunk
         if current_chunk and len(current_chunk) + len(sentence) + 1 > max_chars:
             chunks.append(current_chunk.strip())
             current_chunk = sentence
@@ -267,10 +209,6 @@ def _chunk_text(text: str, max_chars: int = TTS_CHUNK_SIZE) -> list:
 
 
 def _concat_audio_chunks(chunk_paths: list, output_path: str) -> bool:
-    """
-    Concatenate multiple MP3 audio files into one using ffmpeg.
-    Returns True on success.
-    """
     if len(chunk_paths) == 1:
         import shutil
         shutil.copy2(chunk_paths[0], output_path)
@@ -308,7 +246,7 @@ def _concat_audio_chunks(chunk_paths: list, output_path: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIX 1: Improved SRT builder — non-uniform timing based on word length
+# SRT builder
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _ms_to_srt(ms: int) -> str:
@@ -321,53 +259,31 @@ def _ms_to_srt(ms: int) -> str:
 
 
 def _build_srt(text: str, total_ms: int, words_per_line: int = 4) -> str:
-    """
-    Build SRT with non-uniform word timing.
-
-    FIX: Old version used uniform ms-per-word which made subtitles feel robotic
-    (all words got identical time regardless of length or punctuation).
-
-    New approach:
-    - Longer words get proportionally more time
-    - Words followed by punctuation (.!?,;:) get +20% pause
-    - Sentence boundaries get a brief gap
-    """
     words = text.split()
     if not words:
         return ""
 
-    # Calculate weighted duration for each word
-    # Weight = character length + punctuation bonus
     weights = []
     for word in words:
-        w = max(len(word), 2)  # minimum weight of 2
-        # Punctuation at end of word = natural pause
+        w = max(len(word), 2)
         if word[-1] in '.!?':
-            w += 4  # full stop = longer pause
+            w += 4
         elif word[-1] in ',;:':
-            w += 2  # comma = shorter pause
+            w += 2
         elif word[-1] in '...':
-            w += 3  # ellipsis = dramatic pause
+            w += 3
         weights.append(w)
 
     total_weight = sum(weights)
-    
-    # Allocate time proportionally
+
     word_durations = []
     for w in weights:
         word_durations.append(int(total_ms * w / total_weight))
 
-    # Group into lines of words_per_line
-    lines = []
-    i = 0
-    line_start_ms = 0
-
-    # Calculate cumulative start times
     cumulative = [0]
     for d in word_durations:
         cumulative.append(cumulative[-1] + d)
 
-    # Group into subtitle blocks
     chunks = [words[j:j+words_per_line] for j in range(0, len(words), words_per_line)]
     chunk_ranges = [(j, min(j+words_per_line, len(words))) for j in range(0, len(words), words_per_line)]
 
@@ -482,6 +398,72 @@ async def _edge_async(text, out_path, sub_path, voice, rate, pitch, volume):
         f.write(srt)
 
 
+def _run_edge_async(text, out_path, sub_path, voice, rate, pitch, volume):
+    """
+    FIX (BUG FIX 4): Run the edge-tts coroutine safely across Python versions.
+
+    Python 3.10+ deprecates asyncio.get_event_loop() in non-async contexts.
+    Python 3.12+ raises RuntimeError when there is no current event loop.
+
+    Strategy:
+      1. Try asyncio.run() — correct for Python 3.7+ in a non-async context.
+      2. If a running event loop exists (nest scenario: Jupyter, async tests),
+         fall back to nest_asyncio if available, otherwise create a new thread.
+    """
+    coro = _edge_async(text, out_path, sub_path, voice, rate, pitch, volume)
+
+    try:
+        # Primary path: standard asyncio.run() — works on all Python 3.7+
+        # and is the correct approach when no event loop is running.
+        asyncio.run(coro)
+        return
+    except RuntimeError as e:
+        err_msg = str(e)
+        # "This event loop is already running" — we're inside an async context
+        if "already running" not in err_msg:
+            raise
+
+    # Fallback: running inside an existing event loop (Jupyter, async test runner)
+    # Try nest_asyncio if available
+    try:
+        import nest_asyncio
+        nest_asyncio.apply()
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(
+            _edge_async(text, out_path, sub_path, voice, rate, pitch, volume)
+        )
+        return
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # Last resort: run in a separate thread with its own event loop
+    import threading
+    exc_holder = []
+
+    def run_in_thread():
+        try:
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            try:
+                new_loop.run_until_complete(
+                    _edge_async(text, out_path, sub_path, voice, rate, pitch, volume)
+                )
+            finally:
+                new_loop.close()
+        except Exception as thread_exc:
+            exc_holder.append(thread_exc)
+
+    t = threading.Thread(target=run_in_thread)
+    t.start()
+    t.join(timeout=120)
+    if exc_holder:
+        raise exc_holder[0]
+    if t.is_alive():
+        raise RuntimeError("edge-tts thread timed out after 120s")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main TTS Server
 # ─────────────────────────────────────────────────────────────────────────────
@@ -531,9 +513,7 @@ class TTSMCPServer:
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         Path(subtitle_path).parent.mkdir(parents=True, exist_ok=True)
 
-        # FIX 1: Preprocess text for natural prosody
         processed_text = _preprocess_for_natural_speech(text)
-
         niche = os.environ.get("NICHE", "default")
 
         # 1️⃣  Chatterbox
@@ -628,11 +608,6 @@ class TTSMCPServer:
     # ── Kokoro ONNX with chunking ─────────────────────────────────────────────
 
     def _kokoro_generate_chunked(self, text, output_path, subtitle_path, voice, niche):
-        """
-        FIX 2: Generate Kokoro audio in chunks to prevent silent truncation.
-        Long scripts (>600 chars) are split at sentence boundaries, each chunk
-        generated separately, then concatenated with ffmpeg.
-        """
         chunks = _chunk_text(text, max_chars=TTS_CHUNK_SIZE)
 
         if len(chunks) == 1:
@@ -646,17 +621,14 @@ class TTSMCPServer:
             chunk_sub = subtitle_path.replace(".srt", f"_chunk_{i:02d}.srt")
             result = self._kokoro_generate(chunk, chunk_path, chunk_sub, voice, niche)
             if not result.get("success"):
-                # Clean up
                 for p in chunk_paths:
                     if os.path.exists(p):
                         os.remove(p)
                 return result
             chunk_paths.append(chunk_path)
 
-        # Concatenate all chunks
         success = _concat_audio_chunks(chunk_paths, output_path)
 
-        # Clean up chunk files
         for p in chunk_paths:
             if os.path.exists(p):
                 os.remove(p)
@@ -667,7 +639,6 @@ class TTSMCPServer:
         size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
         duration_ms = _audio_duration_ms(output_path)
 
-        # Rebuild subtitle from full text with actual duration
         with open(subtitle_path, "w", encoding="utf-8") as f:
             f.write(_build_srt(text, duration_ms))
 
@@ -725,10 +696,6 @@ class TTSMCPServer:
     # ── edge-tts with chunking ─────────────────────────────────────────────────
 
     def _edge_generate_chunked(self, text, output_path, subtitle_path, voice, rate, pitch, volume):
-        """
-        FIX 2: Generate edge-tts audio in chunks.
-        edge-tts can silently drop text beyond ~800 chars in some versions.
-        """
         chunks = _chunk_text(text, max_chars=TTS_CHUNK_SIZE)
 
         if len(chunks) == 1:
@@ -760,7 +727,6 @@ class TTSMCPServer:
         size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
         duration_ms = _audio_duration_ms(output_path)
 
-        # Rebuild unified SRT from full text
         with open(subtitle_path, "w", encoding="utf-8") as f:
             f.write(_build_srt(text, duration_ms))
 
@@ -776,16 +742,12 @@ class TTSMCPServer:
         }
 
     def _edge_generate(self, text, output_path, subtitle_path, voice, rate, pitch, volume):
+        """
+        FIX (BUG FIX 4): Use _run_edge_async() instead of manually managing
+        the event loop. This is safe on Python 3.10, 3.11, and 3.12+.
+        """
         try:
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running() or loop.is_closed():
-                    raise RuntimeError
-                loop.run_until_complete(
-                    _edge_async(text, output_path, subtitle_path, voice, rate, pitch, volume))
-            except RuntimeError:
-                asyncio.run(
-                    _edge_async(text, output_path, subtitle_path, voice, rate, pitch, volume))
+            _run_edge_async(text, output_path, subtitle_path, voice, rate, pitch, volume)
 
             size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
             if size == 0:
@@ -814,8 +776,7 @@ class TTSMCPServer:
 
     def _gtts_generate(self, text, output_path, subtitle_path):
         try:
-            # FIX 2: chunk gTTS too — it has the same truncation problem
-            chunks = _chunk_text(text, max_chars=400)  # gTTS is more aggressive
+            chunks = _chunk_text(text, max_chars=400)
             chunk_paths = []
 
             for i, chunk in enumerate(chunks):

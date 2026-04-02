@@ -49,19 +49,18 @@ def resolve_niche(args_niche: str, config: dict) -> str:
     return config.get("video", {}).get("niche", "motivation")
 
 
-def resolve_video_count(args_count: int, config: dict) -> int:
+def resolve_video_count(args_count, config: dict) -> int:
     """
     Single authoritative video count resolution.
     Priority: --count CLI arg > DAILY_VIDEO_COUNT env var > config default
 
-    DAILY_VIDEO_COUNT is set by the GitHub Actions workflow_dispatch input.
-    Without this resolution the env var was silently ignored and config
-    always defaulted to 10 regardless of what the user entered in the
-    workflow dispatch form.
+    FIX: args_count default changed to None (was 10) so we can distinguish
+    "user explicitly passed --count 10" from "user didn't pass --count at all".
+    The old check 'args_count != 10' silently ignored an explicit '--count 10'.
     """
     # CLI flag takes highest priority (explicit local override)
-    if args_count and args_count != 10:  # 10 is argparse default — treat as unset
-        return max(1, args_count)
+    if args_count is not None:
+        return max(1, int(args_count))
 
     # GitHub Actions workflow_dispatch input
     env_count = os.environ.get("DAILY_VIDEO_COUNT", "").strip()
@@ -94,7 +93,8 @@ def main():
         help="Content niche (overrides NICHE env var and config)")
     parser.add_argument("--video-id",    default="video_001")
     parser.add_argument("--video-index", type=int, default=0)
-    parser.add_argument("--count",       type=int, default=10,
+    # FIX: default=None so resolve_video_count can distinguish "not passed" from "passed as 10"
+    parser.add_argument("--count",       type=int, default=None,
                         help="Number of videos (overrides DAILY_VIDEO_COUNT env var and config)")
     parser.add_argument("--topics-file", default="topics.json")
     parser.add_argument("--no-upload",   action="store_true",
@@ -126,7 +126,7 @@ def main():
     if args.mode == "research":
         scout  = ResearchScoutAgent(config)
         topics = scout.run()
-        # FIX: only save as many topics as we need
+        # Only save as many topics as we need
         topics = topics[:video_count]
         with open(args.topics_file, "w") as f:
             json.dump(topics, f, indent=2)

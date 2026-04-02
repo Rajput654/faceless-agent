@@ -5,34 +5,14 @@ UPGRADED v2: Center-screen word-by-word highlight captions — viral Shorts styl
 
 Key changes from v1:
   - Captions repositioned to CENTER-SCREEN (Alignment=5) from bottom (Alignment=2)
-    This is the standard for every top-performing faceless channel. Bottom captions
-    compete with YouTube's UI chrome on mobile; center captions own the frame.
   - Font size increased from 54px → 72px for mobile readability
   - Words per group reduced from 5 → 4 (snappier, more readable on small screens)
-  - Added UPPERCASE enforcement at the ASS level (was already done but now explicit)
+  - Added UPPERCASE enforcement at the ASS level
   - Stroke weight increased from 4px → 6px for better contrast on varied backgrounds
-  - Shadow upgraded to a stronger drop shadow for readability on bright stock footage
+  - Shadow upgraded to a stronger drop shadow
 
-How it works:
-  1. The TTS server (edge-tts) already collects per-word timing in _wbs_to_srt()
-     and writes a standard SRT file where each caption block = 5 words.
-  2. This agent parses that SRT to get word-group timings.
-  3. It then builds an ASS subtitle file where:
-     - Each 4-word group appears as a subtitle event
-     - WITHIN that group, each individual word is highlighted in YELLOW
-       as it is spoken, while the rest of the group stays WHITE
-     - This creates the "karaoke highlight" effect used by every
-       premium faceless channel
-
-FONT STYLE (updated):
-  Font: Arial (Bold=true via ASS Bold flag)
-  Size: 72px (was 54px — larger = more readable on mobile)
-  Primary (unhighlighted): White &H00FFFFFF
-  Highlight (active word): Yellow &H0000FFFF
-  Outline: Black, 6px thick (was 4px)
-  Shadow: 3px strong drop shadow
-  Position: CENTER of screen (Alignment=5) — not bottom
-  Words per group: 4 (was 5 — tighter = snappier)
+FIX: _rechunk_entries — division by zero when total_audio_ms == 0
+  (e.g. ffprobe fails on voice file). Guard added with max(total_audio_ms, 1000).
 """
 import os
 import re
@@ -112,17 +92,9 @@ class CaptionMakerAgent:
         return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
     # ------------------------------------------------------------------
-    # ASS header — UPGRADED: center-screen, 72px, heavier stroke
+    # ASS header — center-screen, 72px, heavier stroke
     # ------------------------------------------------------------------
     def _create_ass_header(self) -> str:
-        """
-        Viral caption style:
-        - Arial Bold, 72px (was 54px)
-        - Center-screen alignment (Alignment=5, was 2=bottom-centre)
-        - White text / yellow active word highlight
-        - 6px black outline (was 4px) + stronger shadow
-        - MarginV=0 (center-screen ignores margin)
-        """
         return (
             "[Script Info]\n"
             "ScriptType: v4.00+\n"
@@ -136,13 +108,12 @@ class CaptionMakerAgent:
             "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
             "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
             "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-            # UPGRADED: 72px, Alignment=5 (center), Outline=6, Shadow=3
             f"Style: Default,Arial,72,{COLOUR_WHITE},{COLOUR_YELLOW},"
             f"{COLOUR_OUTLINE},{COLOUR_SHADOW},"
-            "-1,0,0,0,"           # Bold=-1(true), Italic=0, Underline=0, StrikeOut=0
-            "100,100,2,0,"        # ScaleX=100, ScaleY=100, Spacing=2, Angle=0
-            "1,6,3,"              # BorderStyle=1, Outline=6 (was 4), Shadow=3 (was 2)
-            "5,80,80,0,1\n"       # Alignment=5 (CENTER-SCREEN, was 2=bottom), MarginV=0
+            "-1,0,0,0,"
+            "100,100,2,0,"
+            "1,6,3,"
+            "5,80,80,0,1\n"
             "\n"
             "[Events]\n"
             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
@@ -152,11 +123,6 @@ class CaptionMakerAgent:
     # CORE: Word-by-word karaoke highlight builder
     # ------------------------------------------------------------------
     def _build_karaoke_events(self, entries: list) -> str:
-        """
-        Builds ASS karaoke dialogue lines where each word highlights
-        in yellow as it is spoken.
-        ASS karaoke tag: {\\kNN} where NN = duration in centiseconds.
-        """
         events = []
         for entry in entries:
             start_ms = entry["start_ms"]
@@ -165,7 +131,7 @@ class CaptionMakerAgent:
             text     = entry["text"].strip()
 
             text = re.sub(r"<[^>]+>", "", text)
-            text = text.upper()  # UPPERCASE — standard for viral captions
+            text = text.upper()
 
             words = text.split()
             if not words:
@@ -217,7 +183,6 @@ class CaptionMakerAgent:
                 parts = []
                 for j, w in enumerate(words):
                     if j == i:
-                        # Active word → yellow + slight scale boost
                         parts.append(
                             f"{{\\c{COLOUR_YELLOW}\\fscx115\\fscy115}}{w}"
                             f"{{\\c{COLOUR_WHITE}\\fscx100\\fscy100}}"
@@ -237,6 +202,7 @@ class CaptionMakerAgent:
 
     # ------------------------------------------------------------------
     # Re-chunk entries into WORDS_PER_GROUP=4 groups
+    # FIX: Guard against total_audio_ms == 0 (division by zero)
     # ------------------------------------------------------------------
     def _rechunk_entries(self, entries: list) -> list:
         if not entries:
@@ -247,6 +213,15 @@ class CaptionMakerAgent:
 
         if total_words == 0:
             return entries
+
+        # FIX: Guard division by zero — if ffprobe failed and all timestamps
+        # are 0, use a sensible fallback of 500ms per word (typical speech rate)
+        if total_audio_ms <= 0:
+            logger.warning(
+                "_rechunk_entries: total_audio_ms is 0 — "
+                "ffprobe may have failed. Using 500ms/word fallback."
+            )
+            total_audio_ms = total_words * 500
 
         avg_ms_per_word = total_audio_ms / total_words
 
@@ -316,7 +291,6 @@ class CaptionMakerAgent:
         if not entries:
             return False
 
-        # Use same upgraded header for consistency
         header = (
             "[Script Info]\n"
             "ScriptType: v4.00+\n"
@@ -329,7 +303,6 @@ class CaptionMakerAgent:
             "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
             "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
             "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-            # Center-screen, 72px, heavy stroke
             "Style: Default,Arial,72,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
             "-1,0,0,0,100,100,2,0,1,6,3,5,80,80,0,1\n"
             "\n"

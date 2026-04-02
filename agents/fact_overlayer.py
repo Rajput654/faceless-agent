@@ -5,23 +5,17 @@ Burns bold on-screen fact/keyword overlays into the video at key moments.
 These are the large-text cards that appear mid-screen — the "dual stimulus"
 technique used by every top faceless channel.
 
-What it does:
-  - Takes key_facts from the Pass 1 extractor output (via script["_extracted"])
-  - Places up to 3 bold yellow text cards at 25%, 50%, 72% of video duration
-  - Each card appears for 2.0 seconds with a subtle fade-in/fade-out
-  - Cards are center-screen (not competing with caption track at bottom)
-  - Falls back gracefully — if overlay fails, original video is returned
+FIX: _clean_text_for_drawtext may return an empty string after stripping
+problematic characters. If an empty text is passed to FFmpeg's drawtext
+filter, it raises "Option text not found" and the entire overlay step fails
+(previously causing the video_workflow to fall back to the pre-overlay video,
+which is recoverable but wastes time and loses all overlay cards).
 
-Visual style:
-  - Font: DejaVu Sans Bold (always available on Ubuntu/CI)
-  - Size: 72px (readable on mobile)
-  - Color: Yellow text, thick black border (matches caption highlight color)
-  - Position: Vertically centered, horizontally centered
-  - Animation: 0.2s fade in, 0.2s fade out per card
-
-This creates the "dual stimulus" effect: viewer is reading the card AND
-listening to the voice simultaneously, doubling engagement and killing
-the urge to swipe.
+Fix applied in two places:
+  1. _clean_text_for_drawtext — returns None if result is empty
+  2. _burn_overlays — skips any overlay whose cleaned text is None or empty,
+     and returns False immediately if no valid overlays remain (instead of
+     building an empty drawtext filter).
 """
 import os
 import re
@@ -46,10 +40,14 @@ def _find_font() -> str:
     return ""  # ffmpeg will use built-in default if no font found
 
 
-def _clean_text_for_drawtext(text: str, max_chars: int = 40) -> str:
+def _clean_text_for_drawtext(text: str, max_chars: int = 40):
     """
     Sanitize text for FFmpeg drawtext filter.
     drawtext is sensitive to: single quotes, colons, backslashes, newlines.
+
+    FIX: Returns None (not empty string) if cleaning results in empty text,
+    so callers can skip building a drawtext filter for this overlay entirely.
+    ffmpeg raises "Option text not found" when text='' is passed.
     """
     # Truncate
     text = text[:max_chars]
@@ -58,7 +56,10 @@ def _clean_text_for_drawtext(text: str, max_chars: int = 40) -> str:
     # Collapse whitespace
     text = re.sub(r"\s+", " ", text).strip()
     # Uppercase for impact
-    return text.upper()
+    result = text.upper()
+
+    # FIX: return None instead of empty string so callers can skip safely
+    return result if result else None
 
 
 def _split_into_lines(text: str, max_chars_per_line: int = 20) -> str:
@@ -111,19 +112,15 @@ class FactOverlayerAgent:
         extracted = script.get("_extracted", {})
         key_facts = extracted.get("key_facts", [])
 
-        # Also try to get a "wow" number or statistic from the script title/hook
         hook = script.get("hook", "")
         title = script.get("title", "")
 
-        # Build overlay texts — key facts are best, fall back to hook keywords
         overlay_texts = []
         for fact in key_facts:
             if fact and len(fact.strip()) > 3:
                 overlay_texts.append(fact.strip())
 
-        # If we have fewer than 2 overlay texts, extract hook keywords
         if len(overlay_texts) < 2 and hook:
-            # Extract the most impactful words from the hook
             hook_words = " ".join(hook.split()[:6])
             if hook_words not in overlay_texts:
                 overlay_texts.insert(0, hook_words)
@@ -138,8 +135,6 @@ class FactOverlayerAgent:
             logger.warning("Could not determine video duration")
             return {"success": True, "video_path": video_path, "overlays_added": 0}
 
-        # Placement timestamps: 20%, 48%, 72% of video
-        # Avoid the first 3s (hook) and last 5s (CTA)
         safe_start = 4.0
         safe_end = max(duration - 6.0, duration * 0.7)
         safe_range = safe_end - safe_start
@@ -190,36 +185,36 @@ class FactOverlayerAgent:
     ) -> bool:
         """
         Burn all overlay cards into the video using a single FFmpeg pass.
-        Uses drawtext with alpha/fade via the enable expression.
+
+        FIX: Skip any overlay whose text is empty after cleaning (would cause
+        ffmpeg "Option text not found" error). If ALL overlays are empty after
+        cleaning, return False immediately instead of passing an empty -vf to ffmpeg.
         """
         font_arg = f"fontfile={self.font_path}:" if self.font_path else ""
 
         drawtext_filters = []
 
         for i, (text, ts) in enumerate(zip(overlay_texts, timestamps)):
+            # FIX: _clean_text_for_drawtext now returns None for empty results
             clean = _clean_text_for_drawtext(text, max_chars=38)
-            display = _split_into_lines(clean, max_chars_per_line=18)
-
             if not clean:
+                logger.debug(f"Overlay {i+1}: empty after cleaning ('{text}') — skipping")
                 continue
+
+            display = _split_into_lines(clean, max_chars_per_line=18)
 
             t_start = ts
             t_end = ts + card_duration
             t_fade_in_end = t_start + fade_duration
             t_fade_out_start = t_end - fade_duration
 
-            # Alpha expression: fade in → sustain → fade out
-            # FFmpeg alpha via drawtext doesn't support per-character fade,
-            # but we can use 'alpha' expression for the whole text block.
-            # We layer a semi-transparent black box behind using a second drawtext trick.
-
-            # Background shadow box (black, semi-transparent via box)
+            # Background shadow box
             box_filter = (
                 f"drawtext="
                 f"{font_arg}"
                 f"text='{display}':"
                 f"fontsize=72:"
-                f"fontcolor=black@0.0:"  # invisible text, box only
+                f"fontcolor=black@0.0:"
                 f"box=1:boxcolor=black@0.5:boxborderw=20:"
                 f"x=(w-text_w)/2:y=(h/2-text_h/2-10):"
                 f"enable='between(t,{t_start:.2f},{t_end:.2f})'"
@@ -244,7 +239,9 @@ class FactOverlayerAgent:
             drawtext_filters.append(box_filter)
             drawtext_filters.append(text_filter)
 
+        # FIX: if all overlay texts were empty after cleaning, bail early
         if not drawtext_filters:
+            logger.warning("All overlay texts were empty after cleaning — skipping overlay step")
             return False
 
         vf = ",".join(drawtext_filters)

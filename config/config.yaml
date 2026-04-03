@@ -37,7 +37,13 @@ images:
 music:
   provider: "pixabay"
   duration_seconds: 60
-  volume_reduction: 0.12
+  # BUG FIX V6-B: Raised from 0.12 → 0.35
+  # At 0.12 the music was inaudible on phone speakers, especially after
+  # amix normalization was effectively halving the level again.
+  # 0.35 = ~35% of voice level, clearly audible as background music.
+  # The video_server.py also adds normalize=0 to amix so this value
+  # is respected absolutely without further attenuation.
+  volume_reduction: 0.35
 
 youtube:
   category_id: "22"

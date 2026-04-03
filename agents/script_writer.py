@@ -1,39 +1,17 @@
 """
 agents/script_writer.py
 
-FIXED v4 — Four bugs patched:
+FIXED v5 — Deduplication retry support added:
 
-BUG FIX 1 — INCOMPLETE STORY (root causes):
-  a) max_tokens=2000 on Groq free tier caused JSON truncation mid-sentence.
-     FIX: Pass 2 uses max_tokens=3000.
-  b) Silent parse failures returned short fallback without any log.
-     FIX: Parse failures now log the raw response at ERROR level.
-  c) Script truncation in Pass 2: prompt asked for 18-25 sentences but
-     metadata fields consumed most of the token budget.
-     FIX: Script generated first (full budget), metadata derived after.
-  d) Inter-call sleep was 12s — reduced to 8s default.
+NEW: _dedup_hint injection
+  When VideoWorkflow detects a duplicate script, it injects
+  topic_brief["_dedup_attempt"] and topic_brief["_uniqueness_hint"]
+  before retrying. Pass 2 now reads these fields and appends an
+  explicit "take a different angle" instruction to the script prompt
+  so the LLM is forced to produce genuinely new content instead of
+  regenerating the same script with slightly different wording.
 
-BUG FIX 2 — ROBOTIC VOICE (script-side):
-  a) Em-dashes → replaced with commas in _clean_script_for_tts()
-  b) ALL-CAPS words → converted to sentence case
-  c) Long sentences (20+ words) → split at natural conjunction points
-
-BUG FIX 3 — SAME FALLBACK SCRIPT FOR ALL 10 VIDEOS:
-  When Groq rate-limits after video 2-3 in a batch, _fallback_script()
-  was called for every remaining video. The old version had a hardcoded
-  body paragraph identical for every topic. A video about "morning routines"
-  and one about "procrastination" produced the exact same text.
-
-  FIX: FALLBACK_BODY_TEMPLATES provides 2-3 structurally different body
-  templates per niche. Template is selected via:
-    sum(ord(c) for c in video_id) % len(templates)
-  so consecutive batch videos rotate through them. Each template uses
-  {topic}, {angle_sentence}, {hook_clean}, {cta} substitutions pulled
-  from topic_brief — producing genuinely different scripts per video
-  even when the LLM is completely unavailable.
-
-PRESERVED: 4-pass chain (Extract → Write → Hook Sharpen → Loop Engineer)
-PRESERVED: Niche resolved lazily at run() time — not cached at __init__
+PRESERVED: All v4 fixes (BUG FIX 1-3).
 """
 import os
 import re
@@ -50,9 +28,6 @@ except ImportError:
     Groq = None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Niche system prompts for Pass 2
-# ─────────────────────────────────────────────────────────────────────────────
 NICHE_SYSTEM_PROMPTS = {
     "motivation": (
         "You are an elite YouTube Shorts scriptwriter. You write motivational scripts "
@@ -133,12 +108,6 @@ VISUAL RHYTHM RULES (critical for viewer retention):
 - No parentheses, no quotes within the script text.
 - No ALL-CAPS words (TTS will spell them out letter by letter).
 """
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# BUG FIX 3: Varied fallback body templates — one per niche, 2-3 variants each
-# Template slots: {hook_clean}, {topic}, {angle_sentence}, {cta}
-# ─────────────────────────────────────────────────────────────────────────────
 
 FALLBACK_BODY_TEMPLATES = {
     "motivation": [
@@ -279,37 +248,23 @@ FALLBACK_CTA_MAP = {
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# BUG FIX 2: Post-process script to prevent TTS robotic artifacts
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _clean_script_for_tts(script_text: str) -> str:
     text = script_text
-
-    # 1. Em-dash and en-dash → comma pause
     text = re.sub(r'\s*[—–]\s*', ', ', text)
 
-    # 2. ALL-CAPS words → Title Case (preserve short acronyms like "AI", "US")
     def fix_caps(match):
         word = match.group(0)
         if len(word) <= 3:
             return word
         return word.capitalize()
     text = re.sub(r'\b[A-Z]{4,}\b', fix_caps, text)
-
-    # 3. Remove parenthetical content
     text = re.sub(r'\([^)]*\)', '', text)
     text = re.sub(r'\[[^\]]*\]', '', text)
-
-    # 4. Multiple exclamation/question marks → single
     text = re.sub(r'[!]{2,}', '!', text)
     text = re.sub(r'[?]{2,}', '?', text)
-
-    # 5. Quotes within text → remove
     text = re.sub(r'"([^"]*)"', r'\1', text)
     text = re.sub(r"'([^']*)'", r'\1', text)
 
-    # 6. Split very long sentences at conjunction points
     sentences = re.split(r'(?<=[.!?])\s+', text)
     processed_sentences = []
     for sentence in sentences:
@@ -336,12 +291,9 @@ def _clean_script_for_tts(script_text: str) -> str:
             processed_sentences.append(sentence)
 
     text = ' '.join(processed_sentences)
-
-    # 7. Clean up double spaces and double periods
     text = re.sub(r'\s+', ' ', text)
     text = re.sub(r'\.{2,}(?!\.)', '.', text)
     text = re.sub(r'\.\s*,', '.', text)
-
     return text.strip()
 
 
@@ -392,8 +344,6 @@ class ScriptWriterAgent:
         )
         return response.choices[0].message.content.strip()
 
-    # ── Pass 1: Extract ────────────────────────────────────────────────────────
-
     def _pass1_extract(self, topic_brief: dict) -> dict:
         logger.info("  [Pass 1/4] Extracting emotional core...")
 
@@ -439,8 +389,6 @@ Return ONLY this JSON object (no markdown):
                 "visual_anchors": [topic_brief.get("topic", ""), "", ""],
             }
 
-    # ── Pass 2: Write Script ───────────────────────────────────────────────────
-
     def _pass2_write_script(self, topic_brief: dict, extracted: dict, video_id: str) -> dict:
         logger.info("  [Pass 2/4] Writing full script (2-step: script then metadata)...")
 
@@ -460,7 +408,19 @@ Return ONLY this JSON object (no markdown):
         key_facts = extracted.get("key_facts", ["", "", ""])
         visual_anchors = extracted.get("visual_anchors", ["", "", ""])
 
-        # Step A: Generate the full script text (full token budget)
+        # NEW: Inject dedup hint if this is a retry attempt
+        dedup_attempt = topic_brief.get("_dedup_attempt", 0)
+        uniqueness_hint = topic_brief.get("_uniqueness_hint", "")
+        dedup_instruction = ""
+        if dedup_attempt > 0 and uniqueness_hint:
+            dedup_instruction = f"""
+⚠️ UNIQUENESS REQUIRED (attempt {dedup_attempt}):
+{uniqueness_hint}
+You MUST approach this from a completely different angle than before.
+Use different statistics, different opening scenarios, different metaphors.
+The hook, structure, and examples must all differ from any previous version.
+"""
+
         script_prompt = f"""Write a complete YouTube Shorts script for the '{self.niche}' niche.
 
 TOPIC: {topic_brief.get('topic', '')}
@@ -480,13 +440,12 @@ HOOK HINT: {hook_hint}
 TONE: {tone}
 TARGET WORD COUNT: {target_words} words (STRICT — controls video length)
 TARGET SENTENCES: 18-25 sentences
-
+{dedup_instruction}
 {VISUAL_RHYTHM_RULES}
 
 STRUCTURE:
-- HOOK (first 1-2 sentences, max 15 words total): Immediate curiosity gap. Drop viewer mid-story.
-- BODY (sentences 3-20): Key facts in order of increasing surprise. One fact per sentence.
-  Every 4th sentence = concrete visual anchor (person/place/number/action).
+- HOOK (first 1-2 sentences, max 15 words total): Immediate curiosity gap.
+- BODY (sentences 3-20): Key facts in order of increasing surprise.
 - TWIST (sentences 19-22): Land the unexpected angle. Short sentence under 8 words.
 - CTA (last 1-2 sentences): Natural question or challenge. Never say "like and subscribe".
 
@@ -507,10 +466,7 @@ Pure spoken words only. Each sentence on its own line. Begin directly with the h
             logger.info(f"  [Pass 2A] Script: {word_count} words, {len(sentences)} sentences")
 
             if word_count < target_words * 0.6:
-                logger.warning(
-                    f"  [Pass 2A] Script is short: {word_count} words (target: {target_words}). "
-                    f"Raw (first 200 chars): {raw_script[:200]}"
-                )
+                logger.warning(f"  [Pass 2A] Script short: {word_count}/{target_words} words")
 
         except Exception as e:
             logger.error(f"  [Pass 2A] Script generation failed: {e}")
@@ -520,7 +476,6 @@ Pure spoken words only. Each sentence on its own line. Begin directly with the h
             logger.warning("  [Pass 2A] Falling back to template script")
             return self._fallback_script(topic_brief, video_id, target_words)
 
-        # Step B: Generate compact metadata JSON from the script
         meta_prompt = f"""Given this YouTube Shorts script, generate the video metadata.
 
 SCRIPT:
@@ -574,17 +529,11 @@ Return ONLY this compact JSON (no markdown):
             "topic_brief":    topic_brief,
         }
 
-        long_sentences = [s for s in re.split(r'(?<=[.!?])\s+', raw_script) if len(s.split()) > 14]
-        if long_sentences:
-            logger.warning(f"  [Pass 2/4] {len(long_sentences)} long sentences — visual rhythm may suffer")
-
         logger.success(
             f"  [Pass 2/4] Script: '{script_data.get('title', 'Untitled')}' | "
-            f"{script_data['sentence_count']} sentences | {script_data['word_count']} words | niche={self.niche}"
+            f"{script_data['sentence_count']} sentences | {script_data['word_count']} words"
         )
         return script_data
-
-    # ── Pass 3: Hook Sharpener ─────────────────────────────────────────────────
 
     def _pass3_sharpen_hook(self, script_data: dict) -> dict:
         logger.info("  [Pass 3/4] Sharpening hook...")
@@ -603,15 +552,10 @@ Return ONLY this compact JSON (no markdown):
 
 CURRENT OPENING: "{first_sentence}"
 
-FULL SCRIPT CONTEXT (do NOT rewrite this):
-"{original_script[:300]}..."
-
 Rewrite ONLY the opening line to be more visceral and specific.
 - Under 18 words
 - Immediate curiosity gap OR emotional punch
-- Feel like a real person dropping a bombshell
 - No vague words: amazing, incredible, unbelievable, shocking, insane, crazy
-- Use a specific concrete detail from the script if possible
 - No em-dashes. No ALL-CAPS.
 
 Return ONLY the improved opening line. No quotes. No explanation."""
@@ -626,14 +570,10 @@ Return ONLY the improved opening line. No quotes. No explanation."""
                 script_data["script"] = new_script
                 script_data["hook"]   = sharpened_hook
                 logger.success(f"  [Pass 3/4] Hook: \"{sharpened_hook}\"")
-            else:
-                logger.warning("  [Pass 3/4] Sharpened hook too long or empty. Keeping original.")
         except Exception as e:
             logger.warning(f"  [Pass 3/4] Hook sharpening failed: {e}")
 
         return script_data
-
-    # ── Pass 4: Loop Engineer ──────────────────────────────────────────────────
 
     def _pass4_loop_engineer(self, script_data: dict) -> dict:
         logger.info("  [Pass 4/4] Engineering loop CTA...")
@@ -672,22 +612,20 @@ Return ONLY the new CTA sentence."""
                 script_data["script"] = new_script.strip()
                 script_data["cta"]    = loop_cta
                 logger.success(f"  [Pass 4/4] Loop CTA: \"{loop_cta}\"")
-            else:
-                logger.warning(f"  [Pass 4/4] Invalid CTA: '{loop_cta}'. Keeping original.")
         except Exception as e:
             logger.warning(f"  [Pass 4/4] Loop engineering failed: {e}")
 
         return script_data
 
-    # ── Public entry point ─────────────────────────────────────────────────────
-
     def run(self, topic_brief: dict, video_id: str, *args, **kwargs) -> dict:
         self.niche    = self._get_niche()
         self.template = self._load_template(self.niche)
 
+        dedup_attempt = topic_brief.get("_dedup_attempt", 0)
         logger.info(
             f"ScriptWriterAgent → niche={self.niche} | "
             f"4-pass chain for: {topic_brief.get('topic', 'Unknown')}"
+            + (f" [dedup retry #{dedup_attempt}]" if dedup_attempt else "")
         )
 
         try:
@@ -706,7 +644,6 @@ Return ONLY the new CTA sentence."""
                 cleaned = _clean_script_for_tts(script_data["script"])
                 if cleaned:
                     script_data["script"] = cleaned
-                    logger.info(f"  Script cleaned for TTS: {len(cleaned)} chars")
 
             emotion = script_data.get("emotion", "curiosity")
             script_data["_extracted"]  = extracted
@@ -715,8 +652,7 @@ Return ONLY the new CTA sentence."""
             logger.success(
                 f"ScriptWriterAgent complete | niche={self.niche} | "
                 f"Title: '{script_data.get('title', 'Untitled')}' | "
-                f"Words: {script_data.get('word_count', 0)} | "
-                f"Hook: '{script_data.get('hook', '')[:60]}'"
+                f"Words: {script_data.get('word_count', 0)}"
             )
             return script_data
 
@@ -726,8 +662,6 @@ Return ONLY the new CTA sentence."""
             wps = self.template.get("avg_words_per_second", 2.5) if self.template else 2.5
             target_words = int(duration * wps)
             return self._fallback_script(topic_brief, video_id, target_words)
-
-    # ── Helpers ────────────────────────────────────────────────────────────────
 
     @staticmethod
     def _strip_json_fences(raw: str) -> str:
@@ -746,21 +680,12 @@ Return ONLY the new CTA sentence."""
         return raw.strip()
 
     def _fallback_script(self, topic_brief: dict, video_id: str, target_words: int) -> dict:
-        """
-        BUG FIX 3: Build a varied, topic-specific fallback script without an LLM.
-
-        Uses video_id to select different template variants so consecutive
-        fallback calls in a batch produce structurally different scripts.
-        Content words (topic, angle, hook) are substituted into the template
-        so the output is unique per video even within the same niche.
-        """
         topic   = topic_brief.get("topic", "this topic")
         hook    = topic_brief.get("hook", f"Nobody told you this about {topic}...")
         angle   = topic_brief.get("angle", "")
         emotion = topic_brief.get("emotion", "curiosity")
         niche   = self.niche or self._get_niche()
 
-        # Clean hook for inline use — strip trailing punctuation and filler openers
         hook_clean = re.sub(r'[.!?]+$', '', hook).strip()
         hook_clean = re.sub(
             r'^(Nobody told you this about|Stop|The day|Nobody)\s*',
@@ -778,7 +703,10 @@ Return ONLY the new CTA sentence."""
             angle_sentence = f"Most people have the wrong model of {topic.lower()}. "
 
         templates     = FALLBACK_BODY_TEMPLATES.get(niche, FALLBACK_BODY_TEMPLATES["motivation"])
-        template_seed = sum(ord(c) for c in video_id) % len(templates)
+
+        # For dedup retries, shift template index so we get a different variant
+        dedup_attempt = topic_brief.get("_dedup_attempt", 0)
+        template_seed = (sum(ord(c) for c in video_id) + dedup_attempt) % len(templates)
         template      = templates[template_seed]
 
         script = template.format(

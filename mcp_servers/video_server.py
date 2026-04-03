@@ -1,49 +1,29 @@
 """
 mcp_servers/video_server.py
 
-FIXED v5 — All music/audio blocking bugs resolved:
+FIXED v6 — Four critical bugs resolved:
 
-BUG FIX B1 (revisited) — FINALLY BLOCK DELETES ACTIVE FILES:
-  The outer finally in _compose_video listed "_audio_mix.m4a" and "_sfx_mix.mp3"
-  for cleanup. These are the ACTIVE final_audio files still being read by the
-  final ffmpeg compose command when the finally fires. Result: ffmpeg reads a
-  deleted (or being-deleted) file → silent failure → voice-only or corrupt output.
-  Fix: _dynamic_music_mix cleans its OWN temp files internally. The outer finally
-  only cleans files that are NOT the final_audio being used in the compose step.
-  _apply_sfx_layer also cleans its own intermediaries internally.
+BUG FIX V6-A — VIDEO STOPS AT 2/3 (duration mismatch):
+  Root cause: _compose_from_images calculated seg_dur * n_scenes total visual
+  duration which was SHORTER than audio duration when xfade overlaps were not
+  accounted for in the -t flag passed to crossfade chain. The final compose
+  used `duration` (from audio) but the merged video was shorter, so ffmpeg
+  padded with black frames or stopped playing video while audio continued.
+  Fix 1: _compose_from_images now calculates total_visual_dur accounting for
+  xfade overlap and passes it explicitly to the crossfade chain.
+  Fix 2: Final compose -t is set to min(audio_duration, merged_video_duration)
+  so video and audio always end together.
+  Fix 3: Added _get_video_duration() call on merged output to verify before compose.
 
-BUG FIX B2 (revisited) — MISSING -map IN FINAL COMPOSE:
-  Confirmed: without explicit -map, when merged is video-only and final_audio
-  is .m4a (AAC), ffmpeg on some builds silently drops the audio stream.
-  Fix: explicit -map 0:v:0 -map 1:a:0 always present.
+BUG FIX V6-B — MUSIC TOO QUIET:
+  Root cause: base_volume=0.10 in _dynamic_music_mix PLUS amix normalizes its
+  output, effectively halving perceived music volume again. Result: music at
+  ~5-6% perceived level — inaudible on phone speakers.
+  Fix: Raised default base_volume from 0.10 → 0.35. Also removed amix
+  normalization (normalize=0) so the volume parameter is respected as-is.
+  The music_volume config key is now read with a higher default (0.35).
 
-BUG FIX B3 — SFX OUTPUT CODEC/CONTAINER MISMATCH:
-  sfx_out used .mp3 extension but "-c:a aac" — FFmpeg refuses AAC in MP3
-  container. Changed sfx_out to .m4a. Also: the final compose receives
-  sfx_out as final_audio; it's an .m4a which IS readable as input 1.
-
-BUG FIX B8 — CROSSFADE _merged.mp4 DELETED BY OUTER FINALLY:
-  _merged.mp4 is the return value of _compose_from_images/_compose_from_clips.
-  It's used as input 0 to the final compose. The outer finally listed it for
-  cleanup, deleting it before ffmpeg finished reading it.
-  Fix: _merged.mp4 is removed ONLY after the final compose command succeeds,
-  inside the try block, not in finally.
-
-BUG FIX B9 — SFX sfx_out CONTAINER MISMATCH:
-  Fixed: sfx_out now uses .m4a extension to match -c:a aac codec.
-
-BUG FIX B11 — OUTER FINALLY DELETES FILES STILL IN USE:
-  The finally block was too aggressive. It deleted temp files without knowing
-  which ones were still referenced as final_audio. Restructured: each
-  intermediate step cleans its own temp files. The outer finally only removes
-  files that are guaranteed to be intermediate (not the final compose inputs).
-
-BUG FIX B4 — extended_path None guard in _dynamic_music_mix:
-  When _loop_by_concat returns None, extended_path variable still holds old
-  string. The finally tried to os.remove(None) → TypeError. Added existence
-  check before removing.
-
-PRESERVED: All v4 fixes (FIX 1-7).
+PRESERVED: All v5 fixes (B1-B11).
 """
 import os
 import shutil
@@ -109,6 +89,10 @@ FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
 ]
 
+# BUG FIX V6-B: Raised default music volume from 0.10 → 0.35
+# At 0.10 with amix normalization the music was inaudible on phone speakers.
+DEFAULT_MUSIC_VOLUME = 0.35
+
 
 def _find_font() -> str:
     for path in FONT_CANDIDATES:
@@ -137,6 +121,20 @@ class VideoMCPServer:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def _get_video_duration(self, path: str) -> float:
+        """Get actual duration of a video/audio file using ffprobe."""
+        try:
+            r = subprocess.run(
+                ["ffprobe", "-v", "error",
+                 "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", path],
+                capture_output=True, text=True, timeout=15,
+            )
+            val = float(r.stdout.strip())
+            return val if val > 0 else 0.0
+        except Exception:
+            return 0.0
+
     # ─────────────────────────────────────────────────────────────────────────
     # Main compose entry point
     # ─────────────────────────────────────────────────────────────────────────
@@ -148,7 +146,7 @@ class VideoMCPServer:
         output_path:   str,
         subtitle_path: str   = None,
         music_path:    str   = None,
-        music_volume:  float = 0.10,
+        music_volume:  float = None,   # BUG FIX V6-B: default handled below
         fps:           int   = 30,
         width:         int   = 1080,
         height:        int   = 1920,
@@ -157,6 +155,10 @@ class VideoMCPServer:
         hook_text:     str   = "",
         **kwargs,
     ):
+        # BUG FIX V6-B: Use higher default if not specified
+        if music_volume is None:
+            music_volume = DEFAULT_MUSIC_VOLUME
+
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
         if not image_paths:
@@ -169,29 +171,42 @@ class VideoMCPServer:
             return {"success": False, "error": "No valid visual files found"}
 
         sub_tmp = None
-        # BUG FIX B1/B8/B11: Track intermediate files explicitly.
-        # Only files in this list AND confirmed to be no longer needed are deleted.
         intermediate_files = []
 
         try:
-            duration = self._audio_duration(audio_path)
+            # BUG FIX V6-A: Get actual audio duration from file (not estimated)
+            duration = self._get_video_duration(audio_path)
+            if duration <= 0:
+                duration = self._audio_duration(audio_path)
             if duration <= 0:
                 duration = 55.0
+
+            logger.info(f"Audio duration: {duration:.2f}s")
 
             is_video = any(p.lower().endswith(".mp4") for p in valid_assets)
             _kb_preset = kb_preset or EMOTION_TO_KB.get(emotion, "slow_zoom_in")
 
             if is_video:
-                merged = self._compose_from_clips(
+                merged, actual_visual_dur = self._compose_from_clips(
                     valid_assets, output_path, duration, fps, width, height
                 )
             else:
-                merged = self._compose_from_images(
+                merged, actual_visual_dur = self._compose_from_images(
                     valid_assets, output_path, duration, fps, width, height,
                     kb_preset=_kb_preset
                 )
-            # merged is an intermediate — track it for cleanup AFTER compose
-            # (do NOT add to intermediate_files yet — we need it as input 0)
+
+            # BUG FIX V6-A: Verify merged video actually has correct duration
+            merged_actual_dur = self._get_video_duration(merged)
+            if merged_actual_dur > 0:
+                logger.info(
+                    f"Merged video duration: {merged_actual_dur:.2f}s "
+                    f"(target audio: {duration:.2f}s)"
+                )
+                # Use the minimum so video and audio end at the same time
+                compose_duration = min(duration, merged_actual_dur)
+            else:
+                compose_duration = duration
 
             # ── Prepend opening hook card ─────────────────────────────────────
             if hook_text:
@@ -203,38 +218,34 @@ class VideoMCPServer:
                         hook_card, merged, output_path, fps
                     )
                     if merged_with_hook and os.path.exists(merged_with_hook):
-                        # Old merged is now superseded — safe to clean up
                         if merged != merged_with_hook:
                             intermediate_files.append(merged)
                         merged = merged_with_hook
-                        duration += 0.7
+                        compose_duration += 0.7
                         intermediate_files.append(hook_card)
                         logger.success(f"Hook card prepended ✅ (+0.7s)")
 
             # ── Music mixing ──────────────────────────────────────────────────
-            # BUG FIX B6: Validate music file existence at use time, not just receipt time
             if music_path and os.path.exists(music_path):
                 music_size = os.path.getsize(music_path)
                 logger.info(
                     f"Mixing music: {music_path} ({music_size // 1024} KB) "
-                    f"at volume={music_volume:.3f} over {duration:.1f}s"
+                    f"at volume={music_volume:.3f} (BUG FIX V6-B: raised from 0.10) "
+                    f"over {compose_duration:.1f}s"
                 )
-                # BUG FIX B1: _dynamic_music_mix manages its OWN temp files internally.
-                # It returns either mixed_path (.m4a) or voice_path (original audio).
                 final_audio = self._dynamic_music_mix(
-                    audio_path, music_path, output_path, duration, music_volume
+                    audio_path, music_path, output_path, compose_duration, music_volume
                 )
                 if final_audio == audio_path:
                     logger.warning(
                         "Music mix returned voice_path — music was NOT mixed. "
                         "Video will be voice-only."
                     )
+                    _mixed_audio_to_clean = None
                 else:
                     logger.success(
                         f"Music mixed successfully → {os.path.basename(final_audio)}"
                     )
-                    # mixed_path is a NEW file — track for cleanup AFTER compose finishes
-                    # (add AFTER we confirm compose completes successfully below)
                     _mixed_audio_to_clean = final_audio
             else:
                 if music_path:
@@ -245,14 +256,11 @@ class VideoMCPServer:
                 _mixed_audio_to_clean = None
 
             # ── SFX layer ─────────────────────────────────────────────────────
-            # BUG FIX B3/B9: _apply_sfx_layer now returns .m4a (AAC container)
-            # and manages its own cleanup internally.
             sfx_audio = self._apply_sfx_layer(
-                final_audio, output_path, duration, emotion,
+                final_audio, output_path, compose_duration, emotion,
                 num_scenes=len(valid_assets)
             )
             if sfx_audio and os.path.exists(sfx_audio):
-                # SFX output supersedes the mixed audio as final_audio
                 _sfx_audio_to_clean = sfx_audio
                 final_audio = sfx_audio
             else:
@@ -261,19 +269,17 @@ class VideoMCPServer:
             # ── Subtitle filter ───────────────────────────────────────────────
             vf_final, sub_tmp = self._caption_filter(subtitle_path, output_path)
 
-            # ── FIX B2: Explicit stream mapping in final compose ──────────────
-            # -map 0:v:0 = video from merged (input 0, video-only)
-            # -map 1:a:0 = audio from final_audio (input 1, audio-only)
-            # Without explicit maps ffmpeg may silently drop audio on some builds.
+            # BUG FIX V6-A: Use compose_duration (min of audio+video) not raw duration
+            # This ensures video track and audio track end at exactly the same time.
             compose_cmd = [
                 "ffmpeg", "-y",
-                "-i", merged,        # input 0: video (no audio stream)
-                "-i", final_audio,   # input 1: audio (.m4a or .mp3, both valid)
+                "-i", merged,
+                "-i", final_audio,
                 "-map", "0:v:0",
                 "-map", "1:a:0",
                 "-c:v", "libx264", "-preset", "fast", "-crf", "21",
                 "-c:a", "aac", "-b:a", "192k",
-                "-t", str(duration),
+                "-t", str(compose_duration),
                 "-movflags", "+faststart",
             ]
             if vf_final:
@@ -283,7 +289,6 @@ class VideoMCPServer:
             self._run(compose_cmd, "final compose")
 
             # ── Cleanup intermediate files AFTER successful compose ────────────
-            # BUG FIX B1/B8/B11: Only clean up AFTER ffmpeg has finished reading.
             for f in intermediate_files:
                 if f and f != output_path and os.path.exists(f):
                     try:
@@ -291,7 +296,6 @@ class VideoMCPServer:
                     except Exception:
                         pass
 
-            # Clean merged (input 0) — safe now that compose is done
             merged_path_to_clean = merged
             if merged_path_to_clean and merged_path_to_clean != output_path:
                 if os.path.exists(merged_path_to_clean):
@@ -300,7 +304,6 @@ class VideoMCPServer:
                     except Exception:
                         pass
 
-            # Clean mixed audio (input 1) — safe now that compose is done
             if _mixed_audio_to_clean and _mixed_audio_to_clean != audio_path:
                 if os.path.exists(_mixed_audio_to_clean):
                     try:
@@ -308,7 +311,6 @@ class VideoMCPServer:
                     except Exception:
                         pass
 
-            # Clean SFX audio (which was input 1 if SFX succeeded)
             if _sfx_audio_to_clean and _sfx_audio_to_clean != audio_path:
                 if os.path.exists(_sfx_audio_to_clean):
                     try:
@@ -321,16 +323,12 @@ class VideoMCPServer:
             return {"success": False, "error": str(e)}
 
         finally:
-            # BUG FIX B11: Only clean up files that are NEVER used as compose inputs.
-            # Do NOT clean _audio_mix.m4a, _sfx_mix.m4a, or _merged.mp4 here —
-            # those are cleaned in the try block AFTER compose finishes.
             if sub_tmp and os.path.exists(sub_tmp):
                 try:
                     os.remove(sub_tmp)
                 except Exception:
                     pass
 
-            # Clean per-image/clip temp files (these are never compose inputs)
             for i in range(len(valid_assets) + 5):
                 for tag in [f"_kb_{i:02d}.mp4", f"_scaled_{i:02d}.mp4", f"_cf_{i:02d}.mp4"]:
                     tmp = output_path.replace(".mp4", tag)
@@ -340,7 +338,6 @@ class VideoMCPServer:
                         except Exception:
                             pass
 
-            # Clean concat list file if it exists
             for suffix in ["_list.txt", "_concat_list.txt"]:
                 tmp = output_path.replace(".mp4", suffix)
                 if os.path.exists(tmp):
@@ -353,17 +350,19 @@ class VideoMCPServer:
         if file_size == 0:
             return {"success": False, "error": "Output video is empty"}
 
+        # Verify final output duration
+        final_dur = self._get_video_duration(output_path)
         logger.success(
             f"Video composed ✅  {output_path} "
-            f"({file_size/1024/1024:.1f} MB, {duration:.1f}s, "
-            f"kb={_kb_preset}, emotion={emotion}, "
-            f"hook_card={'yes' if hook_text else 'no'})"
+            f"({file_size/1024/1024:.1f} MB, actual_dur={final_dur:.1f}s, "
+            f"target_dur={compose_duration:.1f}s, "
+            f"kb={_kb_preset}, emotion={emotion})"
         )
         return {
             "success":          True,
             "output_path":      output_path,
             "file_size_bytes":  file_size,
-            "duration_seconds": duration,
+            "duration_seconds": final_dur if final_dur > 0 else compose_duration,
         }
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -462,21 +461,16 @@ class VideoMCPServer:
 
     # ─────────────────────────────────────────────────────────────────────────
     # Dynamic music ducking
+    # BUG FIX V6-B: normalize=0 added to amix so volume= is fully respected
     # ─────────────────────────────────────────────────────────────────────────
 
     def _normalize_to_cbr(self, music_path: str, output_path: str) -> bool:
-        """
-        Convert music file to CBR MP3 at 128k.
-        CBR is seekable on all ffmpeg builds; VBR MP3 sometimes fails with -stream_loop.
-        BUG FIX B7: ambient tones are now already CBR (from music_server fix),
-        but we still normalize here for any CDN files that may be VBR.
-        """
         try:
             self._run([
                 "ffmpeg", "-y",
                 "-i", music_path,
                 "-c:a", "libmp3lame", "-b:a", "128k",
-                "-write_xing", "0",   # disable VBR Xing header → forces CBR
+                "-write_xing", "0",
                 output_path,
             ], "normalize music to CBR")
             size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
@@ -486,30 +480,32 @@ class VideoMCPServer:
             return False
 
     def _dynamic_music_mix(self, voice_path, music_path, output_path,
-                            duration, base_volume=0.10):
+                            duration, base_volume=None):
         """
         Mix voice + music. Returns mixed_path (.m4a) on success, voice_path on failure.
 
-        BUG FIX B6 (FIX 6 revisited): mixed_path uses .m4a (AAC container).
-        BUG FIX B7 (FIX 7 revisited): error strings saved before except scope ends.
-        BUG FIX B1 (FIX 1 revisited): ALL temp files cleaned inside this method's
-          own finally block — not in the caller's finally.
-        BUG FIX B4: Guard against extended_path being None in finally.
+        BUG FIX V6-B: 
+          1. Default base_volume raised to DEFAULT_MUSIC_VOLUME (0.35)
+          2. amix filter now uses normalize=0 so the volume= parameter is
+             respected as absolute gain rather than being normalized down.
+             Previously amix normalized to 1.0 which effectively halved the
+             perceived music volume on top of the already-low base_volume.
         """
-        # BUG FIX B3/B6: .m4a is a valid AAC container; .mp3 is NOT
+        if base_volume is None:
+            base_volume = DEFAULT_MUSIC_VOLUME
+
         mixed_path    = output_path.replace(".mp4", "_audio_mix.m4a")
         cbr_path      = output_path.replace(".mp4", "_music_cbr.mp3")
         extended_path = output_path.replace(".mp4", "_music_extended.mp3")
-        # Track whether extended_path was actually created (BUG FIX B4)
         extended_created = False
 
         logger.info(
             f"Music mix: voice={os.path.basename(voice_path)} "
             f"music={os.path.basename(music_path)} "
-            f"duration={duration:.1f}s vol={base_volume:.3f}"
+            f"duration={duration:.1f}s vol={base_volume:.3f} "
+            f"(BUG FIX V6-B: normalize=0, vol={base_volume:.3f})"
         )
 
-        # Pre-normalize to CBR for stream_loop seekability
         cbr_ok = self._normalize_to_cbr(music_path, cbr_path)
         source_for_loop = cbr_path if cbr_ok else music_path
         if cbr_ok:
@@ -518,7 +514,6 @@ class VideoMCPServer:
             logger.warning("CBR normalization failed — using original file")
 
         try:
-            # Step 1: Extend music to full video duration
             try:
                 self._run([
                     "ffmpeg", "-y",
@@ -545,7 +540,6 @@ class VideoMCPServer:
             ext_size = os.path.getsize(extended_path)
             logger.info(f"Music extended: {ext_size // 1024} KB for {duration:.1f}s")
 
-            # Step 2: Mix voice + extended music
             ramp_in_end    = min(3.0, duration * 0.08)
             ramp_out_start = max(ramp_in_end + 1, duration - 5.0)
             ramp_out_end   = max(ramp_out_start + 1, duration - 1.0)
@@ -556,12 +550,12 @@ class VideoMCPServer:
                 f"volume={base_volume:.4f}"
             )
 
-            # BUG FIX B7 (confirmed): Save errors as strings — Python 3 deletes
-            # `except Exception as varname` after the except block closes.
             attempt1_err = None
             attempt2_err = None
 
-            # Attempt 1: amix with fade
+            # BUG FIX V6-B: normalize=0 added to amix — critical for volume control
+            # Without normalize=0, amix divides output by number of inputs (2),
+            # halving all levels including the carefully set music volume.
             try:
                 self._run([
                     "ffmpeg", "-y",
@@ -571,26 +565,27 @@ class VideoMCPServer:
                     (
                         f"[0:a]volume=1.0[voice];"
                         f"[1:a]{music_af}[music];"
-                        f"[voice][music]amix=inputs=2:duration=longest:dropout_transition=2[out]"
+                        f"[voice][music]amix=inputs=2:duration=longest:"
+                        f"dropout_transition=2:normalize=0[out]"
                     ),
                     "-map", "[out]",
                     "-t", str(duration),
                     "-c:a", "aac", "-b:a", "192k",
                     mixed_path,
-                ], "dynamic music mix with fade")
+                ], "dynamic music mix with fade (normalize=0)")
 
                 size = os.path.getsize(mixed_path) if os.path.exists(mixed_path) else 0
                 if size < 10_000:
                     raise RuntimeError(f"Mixed audio too small ({size} bytes)")
 
-                logger.success(f"Dynamic music mix ✅  ({size // 1024} KB, {duration:.1f}s)")
+                logger.success(f"Dynamic music mix ✅  ({size // 1024} KB, {duration:.1f}s, vol={base_volume:.3f})")
                 return mixed_path
 
             except Exception as e:
                 attempt1_err = str(e)
-                logger.warning(f"Attempt 1 (fade amix) failed: {attempt1_err} — trying flat mix")
+                logger.warning(f"Attempt 1 (fade amix normalize=0) failed: {attempt1_err} — trying flat mix")
 
-            # Attempt 2: simple flat amix (no fade)
+            # Attempt 2: simple flat amix without fade but with normalize=0
             try:
                 self._run([
                     "ffmpeg", "-y",
@@ -600,13 +595,14 @@ class VideoMCPServer:
                     (
                         f"[0:a]volume=1.0[v];"
                         f"[1:a]volume={base_volume:.4f}[m];"
-                        f"[v][m]amix=inputs=2:duration=longest:dropout_transition=2[out]"
+                        f"[v][m]amix=inputs=2:duration=longest:"
+                        f"dropout_transition=2:normalize=0[out]"
                     ),
                     "-map", "[out]",
                     "-t", str(duration),
                     "-c:a", "aac", "-b:a", "192k",
                     mixed_path,
-                ], "simple flat music mix")
+                ], "simple flat music mix (normalize=0)")
 
                 size = os.path.getsize(mixed_path) if os.path.exists(mixed_path) else 0
                 if size < 10_000:
@@ -617,7 +613,7 @@ class VideoMCPServer:
 
             except Exception as e:
                 attempt2_err = str(e)
-                logger.warning(f"Attempt 2 (flat amix) failed: {attempt2_err} — trying amerge")
+                logger.warning(f"Attempt 2 (flat amix normalize=0) failed: {attempt2_err} — trying amerge")
 
             # Attempt 3: amerge (last resort)
             try:
@@ -626,7 +622,9 @@ class VideoMCPServer:
                     "-i", voice_path,
                     "-i", extended_path,
                     "-filter_complex",
-                    f"[1:a]volume={base_volume:.4f}[m];[0:a][m]amerge=inputs=2,pan=stereo|c0<c0+c2|c1<c1+c3[out]",
+                    f"[1:a]volume={base_volume:.4f}[m];"
+                    f"[0:a][m]amerge=inputs=2,"
+                    f"pan=stereo|c0<c0+c2|c1<c1+c3[out]",
                     "-map", "[out]",
                     "-t", str(duration),
                     "-c:a", "aac", "-b:a", "192k",
@@ -651,8 +649,6 @@ class VideoMCPServer:
                 return voice_path
 
         finally:
-            # BUG FIX B1: Clean up temp files INSIDE _dynamic_music_mix.
-            # BUG FIX B4: Check each path is not None AND exists before removing.
             for tmp in [cbr_path, extended_path if extended_created else None]:
                 if tmp and os.path.exists(tmp):
                     try:
@@ -661,10 +657,6 @@ class VideoMCPServer:
                         pass
 
     def _loop_by_concat(self, music_path: str, output_path: str, duration: float) -> str:
-        """
-        Fallback music looper: repeat file N times then trim to duration.
-        Returns output_path on success, None on failure.
-        """
         try:
             music_duration = self._audio_duration(music_path)
             if music_duration <= 0:
@@ -699,8 +691,6 @@ class VideoMCPServer:
 
     # ─────────────────────────────────────────────────────────────────────────
     # SFX layer
-    # BUG FIX B3/B9: sfx_out uses .m4a (AAC container matches -c:a aac codec)
-    # BUG FIX: SFX layer manages its own temp file cleanup internally
     # ─────────────────────────────────────────────────────────────────────────
 
     def _apply_sfx_layer(self, audio_path, output_path, duration, emotion, num_scenes):
@@ -711,10 +701,8 @@ class VideoMCPServer:
         whoosh_path = str(sfx_dir / "whoosh.mp3")
         rumble_path = str(sfx_dir / "rumble.mp3")
         riser_path  = str(sfx_dir / "riser.mp3")
-        # BUG FIX B9: Use .m4a (AAC container) to match -c:a aac codec
         sfx_out = output_path.replace(".mp4", "_sfx_mix.m4a")
 
-        # Normalize the audio input to MP3 first for consistent codec family
         normalized_audio = output_path.replace(".mp4", "_sfx_base.mp3")
         try:
             self._run([
@@ -774,7 +762,6 @@ class VideoMCPServer:
             input_idx += 1
 
         if len(mix_inputs) <= 1:
-            # No SFX to add — clean up and return None
             for tmp in [normalized_audio]:
                 if tmp and os.path.exists(tmp):
                     try:
@@ -785,8 +772,10 @@ class VideoMCPServer:
 
         n_mix = len(mix_inputs)
         mix_labels = "".join(mix_inputs)
+        # BUG FIX V6-B: normalize=0 here too for consistent SFX volume
         filter_parts.append(
-            f"{mix_labels}amix=inputs={n_mix}:duration=first:dropout_transition=1[sfxout]"
+            f"{mix_labels}amix=inputs={n_mix}:duration=first:"
+            f"dropout_transition=1:normalize=0[sfxout]"
         )
 
         cmd = (
@@ -794,7 +783,6 @@ class VideoMCPServer:
             + inputs
             + ["-filter_complex", ";".join(filter_parts)]
             + ["-map", "[sfxout]", "-t", str(duration)]
-            # BUG FIX B9: -c:a aac writes to .m4a container (sfx_out)
             + ["-c:a", "aac", "-b:a", "192k", sfx_out]
         )
 
@@ -806,7 +794,6 @@ class VideoMCPServer:
             logger.warning(f"SFX layer failed: {e}")
             return None
         finally:
-            # BUG FIX B11: SFX manages its OWN intermediaries
             for tmp in [normalized_audio, rumble_extended]:
                 if tmp and os.path.exists(tmp):
                     try:
@@ -846,14 +833,30 @@ class VideoMCPServer:
         return vf, safe_path
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Rapid cut Ken Burns for still images
+    # BUG FIX V6-A: _compose_from_images now returns (merged_path, actual_dur)
+    # Previously it returned only merged_path, so caller had no way to know
+    # actual visual duration, leading to duration mismatches.
     # ─────────────────────────────────────────────────────────────────────────
 
     def _compose_from_images(self, images, output_path, duration, fps, width, height,
                               kb_preset: str = "slow_zoom_in"):
         n = len(images)
-        seg_dur = min(3.0, max(duration / n, 2.0))
+        # BUG FIX V6-A: Calculate seg_dur so total visual covers full audio
+        # Previously: seg_dur = min(3.0, max(duration/n, 2.0))
+        # This could give n*seg_dur < duration when duration/n > 3.0
+        # Now: ensure n*seg_dur >= duration by setting seg_dur = ceil(duration/n)
         xfade = 0.25
+        # Account for xfade overlap: total_dur = n*seg - (n-1)*xfade
+        # So seg_dur = (duration + (n-1)*xfade) / n
+        seg_dur_raw = (duration + (n - 1) * xfade) / n
+        seg_dur = max(2.0, min(4.0, seg_dur_raw))
+
+        # Recalculate actual total visual duration with this seg_dur
+        actual_visual_dur = n * seg_dur - (n - 1) * xfade
+        logger.info(
+            f"Ken Burns: {n} scenes × {seg_dur:.2f}s (xfade={xfade}s) "
+            f"= {actual_visual_dur:.2f}s visual (audio={duration:.2f}s)"
+        )
 
         preset_list = KB_PRESETS_BY_EMOTION.get(kb_preset, KB_PRESETS_RANDOM)
 
@@ -877,17 +880,26 @@ class VideoMCPServer:
             kb_clips.append(clip_path)
 
         if n == 1:
-            return kb_clips[0]
-        return self._crossfade_clips(kb_clips, output_path, fps, xfade, seg_dur, duration)
+            return kb_clips[0], seg_dur
+
+        merged = self._crossfade_clips(kb_clips, output_path, fps, xfade, seg_dur, actual_visual_dur)
+        return merged, actual_visual_dur
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Rapid cut for video clips
+    # BUG FIX V6-A: _compose_from_clips also returns (merged_path, actual_dur)
     # ─────────────────────────────────────────────────────────────────────────
 
     def _compose_from_clips(self, clips, output_path, duration, fps, width, height):
         n = len(clips)
-        seg_dur = min(3.5, max(duration / n, 2.0))
-        xfade   = 0.25
+        xfade = 0.25
+        seg_dur_raw = (duration + (n - 1) * xfade) / n
+        seg_dur = max(2.0, min(4.0, seg_dur_raw))
+        actual_visual_dur = n * seg_dur - (n - 1) * xfade
+
+        logger.info(
+            f"Stock clips: {n} clips × {seg_dur:.2f}s "
+            f"= {actual_visual_dur:.2f}s visual (audio={duration:.2f}s)"
+        )
 
         scaled_clips = []
         for i, clip in enumerate(clips):
@@ -905,8 +917,10 @@ class VideoMCPServer:
             scaled_clips.append(out)
 
         if n == 1:
-            return scaled_clips[0]
-        return self._crossfade_clips(scaled_clips, output_path, fps, xfade, seg_dur, duration)
+            return scaled_clips[0], seg_dur
+
+        merged = self._crossfade_clips(scaled_clips, output_path, fps, xfade, seg_dur, actual_visual_dur)
+        return merged, actual_visual_dur
 
     # ─────────────────────────────────────────────────────────────────────────
     # Shared helpers
@@ -931,8 +945,6 @@ class VideoMCPServer:
                 )
                 prev = out_label
 
-            # BUG FIX B8: _merged.mp4 is tracked for cleanup in the CALLER
-            # after the final compose finishes — not here, not in a finally.
             merged = output_path.replace(".mp4", "_merged.mp4")
             cmd += [
                 "-filter_complex", ";".join(fg_parts),

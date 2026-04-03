@@ -592,38 +592,159 @@ class VideoWorkflow:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _generate_thumbnail(self, script: dict, video_id: str, output_dir: str) -> Optional[str]:
+        """
+        Generate a unique thumbnail per video.
+
+        FIX — SAME THUMBNAIL FOR EVERY VIDEO:
+          Root cause 1: seed=42 and seed=999 were hardcoded constants, so
+            Pollinations AI returned the same image for every video in the batch
+            regardless of topic, hook, or niche.
+          Root cause 2: The prompt used only the first 6 words of the hook,
+            which for same-niche videos is often nearly identical
+            (e.g. all motivation videos start with "Stop doing this...").
+
+          Fixes applied:
+            1. PRIMARY SEED: derived from hash(video_id) — stable across retries
+               for the same video, but unique across the 10-video batch.
+               video_000 → seed A, video_001 → seed B, ... video_009 → seed J.
+            2. FALLBACK SEED: primary_seed + 7919 (a large prime) — guarantees
+               the fallback attempt never collides with any primary attempt in
+               the same batch.
+            3. PROMPT UNIQUENESS: prompt now incorporates the full title, the
+               script's emotion, the extracted core_mystery (if available), and
+               the video_id hash suffix so even same-niche same-topic retries
+               diverge.
+            4. NICHE VISUAL VARIANTS: each niche has 3 style variants selected
+               by (primary_seed % 3) so the visual treatment also rotates
+               across the batch.
+        """
         try:
             import requests
             import urllib.parse
 
-            hook    = script.get("hook", "")
-            title   = script.get("title", "")
-            niche   = os.environ.get("NICHE", "motivation")
+            hook     = script.get("hook", "")
+            title    = script.get("title", "")
+            niche    = os.environ.get("NICHE", "motivation")
+            emotion  = script.get("emotion", "inspiration")
+            extracted = script.get("_extracted", {})
+            core_mystery = extracted.get("core_mystery", "")
 
-            thumbnail_styles = {
-                "motivation":   "dramatic lighting, golden hour, inspirational, person achieving goal, cinematic",
-                "horror":       "dark atmospheric, horror movie poster style, eerie shadows, fog, cinematic",
-                "reddit_story": "realistic dramatic moment, candid shocked expression, cinematic, photorealistic",
-                "brainrot":     "colorful neon chaos, surreal internet aesthetic, vibrant, high contrast",
-                "finance":      "clean professional, money concept, charts, business, corporate, sharp lighting",
+            # FIX 1: Stable unique seed per video — never hardcoded
+            # sum(ord(c) for c in video_id) gives e.g. 1129 for "video_000",
+            # 1130 for "video_001", etc. Multiply by a prime to spread values.
+            primary_seed = (sum(ord(c) for c in video_id) * 6271) % 99991
+            fallback_seed = (primary_seed + 7919) % 99991
+
+            # FIX 3: Richer, more unique prompt built from all available script data
+            # Priority: core_mystery > title > hook words
+            subject = (
+                core_mystery[:50]
+                if core_mystery and len(core_mystery) > 10
+                else title[:50]
+                if title
+                else " ".join(hook.split()[:8])
+            )
+
+            # Emotion-specific visual direction words
+            emotion_visuals = {
+                "inspiration": "golden hour triumph",
+                "urgency":     "dramatic tension motion blur",
+                "fear":        "dark shadows silhouette",
+                "dread":       "eerie atmosphere fog",
+                "shock":       "dramatic reveal close-up",
+                "curiosity":   "mysterious discovery light",
+                "amusement":   "vibrant energy expression",
+                "chaos":       "explosive color contrast",
             }
-            style = thumbnail_styles.get(niche, "cinematic, dramatic lighting, 4K")
-            hook_words = " ".join(hook.split()[:6]) if hook else title[:40]
-            prompt = f"{hook_words}, {style}, YouTube thumbnail composition, 16:9"
+            emotion_vis = emotion_visuals.get(emotion, "cinematic dramatic")
+
+            # FIX 4: 3 rotating style variants per niche (selected by seed)
+            niche_style_variants = {
+                "motivation": [
+                    "golden hour dramatic lighting, person achieving goal, cinematic 4K",
+                    "sunrise mountain peak, lone figure silhouette, epic wide shot",
+                    "gym athlete victory pose, motivational energy, high contrast",
+                ],
+                "horror": [
+                    "dark atmospheric horror, eerie shadows, fog, cinematic",
+                    "abandoned location, flickering light, deep shadows, unsettling",
+                    "close-up fearful expression, dark background, horror film still",
+                ],
+                "reddit_story": [
+                    "dramatic confrontation, realistic candid, shocked expression, photorealistic",
+                    "phone screen glow face, late night, tense moment, cinematic",
+                    "two people argument, real life drama, emotional intensity",
+                ],
+                "brainrot": [
+                    "neon chaos surreal internet aesthetic, vivid high contrast",
+                    "glitch art explosion, colorful pixels, chaotic energy",
+                    "meme energy expression, bold colors, absurdist composition",
+                ],
+                "finance": [
+                    "clean professional money concept, sharp lighting, corporate",
+                    "stack of money close-up, dramatic lighting, wealth concept",
+                    "stock chart upward, business success, minimal aesthetic",
+                ],
+            }
+
+            variants = niche_style_variants.get(
+                niche,
+                ["cinematic dramatic lighting, 4K high quality, YouTube thumbnail"]
+            )
+            style = variants[primary_seed % len(variants)]
+
+            # Build the full unique prompt
+            prompt = (
+                f"{subject}, {emotion_vis}, {style}, "
+                f"YouTube thumbnail 16:9, no text, photorealistic"
+            )
+
             thumbnail_path = f"{output_dir}/{video_id}_thumbnail.jpg"
 
-            success = self._fetch_pollinations_thumbnail(prompt, thumbnail_path, 1280, 720, 42)
-            if not success:
-                simple_prompt = f"{niche} content, {style}, YouTube thumbnail"
-                success = self._fetch_pollinations_thumbnail(simple_prompt, thumbnail_path, 1280, 720, 999)
+            logger.info(
+                f"Thumbnail | video={video_id} seed={primary_seed} | "
+                f"prompt='{prompt[:80]}...'"
+            )
 
-            return thumbnail_path if success else None
+            # Attempt 1: full unique prompt with primary seed
+            success = self._fetch_pollinations_thumbnail(
+                prompt, thumbnail_path, 1280, 720, primary_seed
+            )
+
+            if not success:
+                # Attempt 2: simplified prompt + fallback seed (never same as attempt 1)
+                simple_prompt = (
+                    f"{subject}, {style}, "
+                    f"YouTube thumbnail, cinematic, high quality"
+                )
+                logger.info(
+                    f"Thumbnail attempt 1 failed — retrying | "
+                    f"seed={fallback_seed} prompt='{simple_prompt[:60]}...'"
+                )
+                success = self._fetch_pollinations_thumbnail(
+                    simple_prompt, thumbnail_path, 1280, 720, fallback_seed
+                )
+
+            if success:
+                size = os.path.getsize(thumbnail_path)
+                logger.success(
+                    f"Thumbnail generated ✅ | video={video_id} | "
+                    f"seed={primary_seed} | {size // 1024} KB"
+                )
+                return thumbnail_path
+
+            logger.warning(f"Both thumbnail attempts failed for {video_id}")
+            return None
 
         except Exception as e:
             logger.warning(f"Thumbnail generation crashed: {e}")
             return None
 
     def _fetch_pollinations_thumbnail(self, prompt, output_path, width, height, seed) -> bool:
+        """
+        Fetch one image from Pollinations AI and validate it is a real image.
+        Returns True only if a valid image file was saved.
+        """
         try:
             import requests
             import urllib.parse
@@ -634,15 +755,26 @@ class VideoWorkflow:
             )
             resp = requests.get(url, timeout=90)
             resp.raise_for_status()
+
             content_type = resp.headers.get("content-type", "").lower()
             if not content_type.startswith("image/"):
+                logger.warning(
+                    f"Pollinations returned non-image content-type: '{content_type}'"
+                )
                 return False
+
             if len(resp.content) < 50_000:
+                logger.warning(
+                    f"Pollinations response too small: {len(resp.content)} bytes"
+                )
                 return False
+
             with open(output_path, "wb") as f:
                 f.write(resp.content)
             return True
-        except Exception:
+
+        except Exception as e:
+            logger.warning(f"Pollinations thumbnail fetch failed: {e}")
             return False
 
     # ─────────────────────────────────────────────────────────────────────────

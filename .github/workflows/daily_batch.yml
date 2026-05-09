@@ -1,5 +1,4 @@
-name: Daily Faceless Video Batch
-
+"""name: Daily Faceless Video Batch
 on:
   schedule:
     - cron: '0 6 * * *'
@@ -340,4 +339,4 @@ jobs:
         run: |
           python upload.py \
             --video-index ${{ matrix.video_index }} \
-            --topics-file topics.json
+            --topics-file topics.json """
